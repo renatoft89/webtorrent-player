@@ -30,7 +30,14 @@ const ShakaVideoPlayer = forwardRef(({
   const [currentQuality, setCurrentQuality] = useState('auto')
   const [playbackRate, setPlaybackRate] = useState(1)
   const [showSettings, setShowSettings] = useState(false)
+  const [settingsTab, setSettingsTab] = useState('quality') // 'quality', 'audio', 'subtitles', 'speed'
   const [isBuffering, setIsBuffering] = useState(false)
+  
+  // Faixas de áudio e legendas
+  const [audioTracks, setAudioTracks] = useState([])
+  const [currentAudioTrack, setCurrentAudioTrack] = useState(null)
+  const [textTracks, setTextTracks] = useState([])
+  const [currentTextTrack, setCurrentTextTrack] = useState(null)
   
   const controlsTimeoutRef = useRef(null)
 
@@ -132,6 +139,12 @@ const ShakaVideoPlayer = forwardRef(({
           const tracks = player.getVariantTracks()
           const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
           setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
+          
+          // Atualizar faixas de áudio
+          updateAudioTracks(player)
+          
+          // Atualizar legendas
+          updateTextTracks(player)
         })
 
         // Carregar mídia
@@ -143,6 +156,11 @@ const ShakaVideoPlayer = forwardRef(({
         const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
         setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
         
+        // Configurar faixas de áudio
+        updateAudioTracks(player)
+        
+        // Configurar legendas
+        updateTextTracks(player)        
         // Tentar autoplay após um pequeno delay
         if (autoPlay && videoRef.current) {
           setTimeout(async () => {
@@ -190,16 +208,34 @@ const ShakaVideoPlayer = forwardRef(({
 
     const handleTimeUpdate = () => {
       setCurrentTime(video.currentTime)
+      
+      // Atualizar duração se disponível (útil para streams que carregam a duração depois)
+      if (video.duration && isFinite(video.duration) && video.duration > 0) {
+        setDuration(video.duration)
+      }
+      
       onTimeUpdate?.(video.currentTime, video.duration)
       
       // Calcular buffer
-      if (video.buffered.length > 0) {
+      if (video.buffered.length > 0 && video.duration && isFinite(video.duration)) {
         const buffered = video.buffered.end(video.buffered.length - 1)
         setBufferedPercent((buffered / video.duration) * 100)
       }
     }
 
-    const handleDurationChange = () => setDuration(video.duration)
+    const handleDurationChange = () => {
+      if (video.duration && isFinite(video.duration) && video.duration > 0) {
+        setDuration(video.duration)
+        console.log('⏱️ Duração do vídeo:', formatTime(video.duration))
+      }
+    }
+    
+    const handleLoadedMetadata = () => {
+      if (video.duration && isFinite(video.duration) && video.duration > 0) {
+        setDuration(video.duration)
+        console.log('📼 Metadados carregados, duração:', formatTime(video.duration))
+      }
+    }
     const handlePlay = () => setIsPlaying(true)
     const handlePause = () => setIsPlaying(false)
     const handleVolumeChange = () => {
@@ -211,6 +247,7 @@ const ShakaVideoPlayer = forwardRef(({
 
     video.addEventListener('timeupdate', handleTimeUpdate)
     video.addEventListener('durationchange', handleDurationChange)
+    video.addEventListener('loadedmetadata', handleLoadedMetadata)
     video.addEventListener('play', handlePlay)
     video.addEventListener('pause', handlePause)
     video.addEventListener('volumechange', handleVolumeChange)
@@ -220,6 +257,7 @@ const ShakaVideoPlayer = forwardRef(({
     return () => {
       video.removeEventListener('timeupdate', handleTimeUpdate)
       video.removeEventListener('durationchange', handleDurationChange)
+      video.removeEventListener('loadedmetadata', handleLoadedMetadata)
       video.removeEventListener('play', handlePlay)
       video.removeEventListener('pause', handlePause)
       video.removeEventListener('volumechange', handleVolumeChange)
@@ -337,9 +375,106 @@ const ShakaVideoPlayer = forwardRef(({
     setShowSettings(false)
   }, [])
 
+  // Atualizar faixas de áudio
+  const updateAudioTracks = useCallback((player) => {
+    const variants = player.getVariantTracks()
+    const audioLanguages = new Map()
+    
+    variants.forEach(variant => {
+      if (variant.audioId && !audioLanguages.has(variant.language)) {
+        audioLanguages.set(variant.language, {
+          language: variant.language || 'und',
+          label: getLanguageLabel(variant.language) || 'Desconhecido',
+          roles: variant.audioRoles || [],
+          channelCount: variant.channelsCount || 2,
+          active: variant.active
+        })
+      }
+    })
+    
+    const tracks = Array.from(audioLanguages.values())
+    setAudioTracks(tracks)
+    
+    const active = tracks.find(t => t.active)
+    if (active) {
+      setCurrentAudioTrack(active.language)
+    }
+  }, [])
+
+  // Atualizar legendas
+  const updateTextTracks = useCallback((player) => {
+    const tracks = player.getTextTracks()
+    const formattedTracks = tracks.map(track => ({
+      id: track.id,
+      language: track.language || 'und',
+      label: track.label || getLanguageLabel(track.language) || 'Desconhecido',
+      kind: track.kind || 'subtitles',
+      active: track.active
+    }))
+    
+    setTextTracks([{ id: 'off', language: 'off', label: 'Desligado' }, ...formattedTracks])
+    
+    const active = formattedTracks.find(t => t.active)
+    setCurrentTextTrack(active ? active.language : 'off')
+  }, [])
+
+  // Mudar faixa de áudio
+  const changeAudioTrack = useCallback((language) => {
+    const player = playerRef.current
+    if (!player) return
+    
+    player.selectAudioLanguage(language)
+    setCurrentAudioTrack(language)
+    setShowSettings(false)
+    console.log(`🔊 Áudio alterado para: ${getLanguageLabel(language)}`)
+  }, [])
+
+  // Mudar legenda
+  const changeTextTrack = useCallback((language) => {
+    const player = playerRef.current
+    if (!player) return
+    
+    if (language === 'off') {
+      player.setTextTrackVisibility(false)
+      setCurrentTextTrack('off')
+    } else {
+      player.setTextTrackVisibility(true)
+      player.selectTextLanguage(language)
+      setCurrentTextTrack(language)
+    }
+    setShowSettings(false)
+    console.log(`📝 Legenda alterada para: ${language === 'off' ? 'Desligado' : getLanguageLabel(language)}`)
+  }, [])
+
+  // Helper para obter nome do idioma
+  const getLanguageLabel = (code) => {
+    const languages = {
+      'pt': 'Português',
+      'pt-BR': 'Português (Brasil)',
+      'pt-PT': 'Português (Portugal)',
+      'en': 'English',
+      'en-US': 'English (US)',
+      'en-GB': 'English (UK)',
+      'es': 'Español',
+      'es-ES': 'Español (España)',
+      'es-MX': 'Español (México)',
+      'fr': 'Français',
+      'de': 'Deutsch',
+      'it': 'Italiano',
+      'ja': 'Japanese (日本語)',
+      'ko': 'Korean (한국어)',
+      'zh': 'Chinese (中文)',
+      'ru': 'Russian (Русский)',
+      'ar': 'Arabic (العربية)',
+      'hi': 'Hindi (हिन्दी)',
+      'und': 'Desconhecido'
+    }
+    return languages[code] || code?.toUpperCase() || 'Desconhecido'
+  }
+
   // Formatar tempo
   const formatTime = (seconds) => {
-    if (!seconds || isNaN(seconds)) return '0:00'
+    if (!seconds || isNaN(seconds) || !isFinite(seconds) || seconds <= 0) return '0:00'
     const h = Math.floor(seconds / 3600)
     const m = Math.floor((seconds % 3600) / 60)
     const s = Math.floor(seconds % 60)
@@ -546,17 +681,34 @@ const ShakaVideoPlayer = forwardRef(({
             <div className="text-white text-sm font-mono ml-2">
               <span className="text-white">{formatTime(currentTime)}</span>
               <span className="text-gray-400 mx-1">/</span>
-              <span className="text-gray-300">{formatTime(duration)}</span>
+              <span className="text-gray-300">{duration > 0 ? formatTime(duration) : '--:--'}</span>
             </div>
 
             <div className="flex-1" />
 
-            {/* Qualidade Badge */}
-            {currentQuality !== 'auto' && (
-              <span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">
-                {currentQuality}
-              </span>
-            )}
+            {/* Badges de status */}
+            <div className="flex items-center gap-2">
+              {/* Badge Áudio */}
+              {currentAudioTrack && currentAudioTrack !== 'und' && (
+                <span className="bg-blue-600 text-white text-xs font-bold px-2 py-0.5 rounded uppercase">
+                  🔊 {currentAudioTrack}
+                </span>
+              )}
+              
+              {/* Badge Legenda */}
+              {currentTextTrack && currentTextTrack !== 'off' && (
+                <span className="bg-green-600 text-white text-xs font-bold px-2 py-0.5 rounded uppercase">
+                  📝 {currentTextTrack}
+                </span>
+              )}
+              
+              {/* Qualidade Badge */}
+              {currentQuality !== 'auto' && (
+                <span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">
+                  {currentQuality}
+                </span>
+              )}
+            </div>
 
             {/* Configurações */}
             <div className="relative">
@@ -571,49 +723,149 @@ const ShakaVideoPlayer = forwardRef(({
               
               {/* Menu de configurações */}
               {showSettings && (
-                <div className="absolute bottom-full right-0 mb-2 bg-gray-900/95 backdrop-blur-sm rounded-lg shadow-xl overflow-hidden min-w-[180px] border border-gray-700">
-                  <div className="p-3 border-b border-gray-700">
-                    <span className="text-gray-400 text-xs font-semibold uppercase tracking-wide">Qualidade</span>
+                <div className="absolute bottom-full right-0 mb-2 bg-gray-900/95 backdrop-blur-sm rounded-lg shadow-xl overflow-hidden min-w-[220px] border border-gray-700">
+                  {/* Abas */}
+                  <div className="flex border-b border-gray-700">
+                    <button
+                      onClick={() => setSettingsTab('quality')}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
+                        settingsTab === 'quality' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      📺 Qualidade
+                    </button>
+                    <button
+                      onClick={() => setSettingsTab('audio')}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
+                        settingsTab === 'audio' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      🔊 Áudio
+                    </button>
+                    <button
+                      onClick={() => setSettingsTab('subtitles')}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
+                        settingsTab === 'subtitles' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      📝 Legendas
+                    </button>
+                    <button
+                      onClick={() => setSettingsTab('speed')}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
+                        settingsTab === 'speed' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      ⚡ Veloc.
+                    </button>
                   </div>
-                  <div className="max-h-48 overflow-y-auto">
-                    {qualities.map((q) => (
-                      <button
-                        key={q}
-                        onClick={() => changeQuality(q)}
-                        className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                          currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
-                        }`}
-                      >
-                        <span>{q === 'auto' ? '🔄 Auto' : q}</span>
-                        {currentQuality === q && (
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
-                          </svg>
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="p-3 border-t border-gray-700">
-                    <span className="text-gray-400 text-xs font-semibold uppercase tracking-wide">Velocidade</span>
-                  </div>
-                  <div>
-                    {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
-                      <button
-                        key={rate}
-                        onClick={() => changePlaybackRate(rate)}
-                        className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                          playbackRate === rate ? 'text-red-500 bg-white/5' : 'text-white'
-                        }`}
-                      >
-                        <span>{rate === 1 ? 'Normal' : `${rate}x`}</span>
-                        {playbackRate === rate && (
-                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
-                          </svg>
-                        )}
-                      </button>
-                    ))}
-                  </div>
+
+                  {/* Conteúdo da aba Qualidade */}
+                  {settingsTab === 'quality' && (
+                    <div className="max-h-48 overflow-y-auto">
+                      {qualities.map((q) => (
+                        <button
+                          key={q}
+                          onClick={() => changeQuality(q)}
+                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
+                            currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
+                          }`}
+                        >
+                          <span>{q === 'auto' ? '🔄 Auto' : q}</span>
+                          {currentQuality === q && (
+                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                            </svg>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Conteúdo da aba Áudio */}
+                  {settingsTab === 'audio' && (
+                    <div className="max-h-48 overflow-y-auto">
+                      {audioTracks.length === 0 ? (
+                        <div className="px-4 py-3 text-gray-400 text-sm text-center">
+                          Nenhuma faixa de áudio disponível
+                        </div>
+                      ) : (
+                        audioTracks.map((track) => (
+                          <button
+                            key={track.language}
+                            onClick={() => changeAudioTrack(track.language)}
+                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
+                              currentAudioTrack === track.language ? 'text-red-500 bg-white/5' : 'text-white'
+                            }`}
+                          >
+                            <div className="flex flex-col">
+                              <span>{track.label}</span>
+                              {track.channelCount && (
+                                <span className="text-xs text-gray-400">
+                                  {track.channelCount >= 6 ? '5.1 Surround' : 'Stereo'}
+                                </span>
+                              )}
+                            </div>
+                            {currentAudioTrack === track.language && (
+                              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                              </svg>
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+
+                  {/* Conteúdo da aba Legendas */}
+                  {settingsTab === 'subtitles' && (
+                    <div className="max-h-48 overflow-y-auto">
+                      {textTracks.length <= 1 ? (
+                        <div className="px-4 py-3 text-gray-400 text-sm text-center">
+                          Nenhuma legenda disponível
+                        </div>
+                      ) : (
+                        textTracks.map((track) => (
+                          <button
+                            key={track.id || track.language}
+                            onClick={() => changeTextTrack(track.language)}
+                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
+                              currentTextTrack === track.language ? 'text-red-500 bg-white/5' : 'text-white'
+                            }`}
+                          >
+                            <span>{track.label}</span>
+                            {currentTextTrack === track.language && (
+                              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                              </svg>
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+
+                  {/* Conteúdo da aba Velocidade */}
+                  {settingsTab === 'speed' && (
+                    <div className="max-h-48 overflow-y-auto">
+                      {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
+                        <button
+                          key={rate}
+                          onClick={() => changePlaybackRate(rate)}
+                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
+                            playbackRate === rate ? 'text-red-500 bg-white/5' : 'text-white'
+                          }`}
+                        >
+                          <span>{rate === 1 ? 'Normal' : `${rate}x`}</span>
+                          {playbackRate === rate && (
+                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                            </svg>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

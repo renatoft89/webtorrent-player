@@ -37,7 +37,7 @@ type QualityLevel struct {
 
 // Níveis de qualidade estilo Netflix
 var qualityLevels = []QualityLevel{
-	{Name: "360p", Width: 640, Height: 360, Bitrate: "800k", MaxBitrate: "856k", BufSize: "1200k", AudioRate: "96k", CRF: 28, Preset: "veryfast"},
+	{Name: "360p", Width: 640, Height: 360, Bitrate: "800k", MaxBitrate: "856k", BufSize: "1200k", AudioRate: "96k", CRF: 28, Preset: "ultrafast"},
 	{Name: "480p", Width: 854, Height: 480, Bitrate: "1400k", MaxBitrate: "1498k", BufSize: "2100k", AudioRate: "128k", CRF: 26, Preset: "veryfast"},
 	{Name: "720p", Width: 1280, Height: 720, Bitrate: "2800k", MaxBitrate: "2996k", BufSize: "4200k", AudioRate: "128k", CRF: 24, Preset: "fast"},
 	{Name: "1080p", Width: 1920, Height: 1080, Bitrate: "5000k", MaxBitrate: "5350k", BufSize: "7500k", AudioRate: "192k", CRF: 22, Preset: "fast"},
@@ -169,9 +169,23 @@ func StartStream(magnetLink string) (*StreamInfo, error) {
 				close(oldStream.cancelChan)
 			}
 			
-			// Remover torrent
+			// Parar processos FFmpeg primeiro
+			for _, proc := range oldStream.ffmpegProcs {
+				if proc != nil && proc.Process != nil {
+					proc.Process.Kill()
+				}
+			}
+			
+			// Remover torrent de forma segura
 			if oldStream.torrent != nil {
-				oldStream.torrent.Drop()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[%s] Torrent já fechado: %v", oldestID[:8], r)
+						}
+					}()
+					oldStream.torrent.Drop()
+				}()
 			}
 			
 			// Limpar arquivos do stream antigo
@@ -261,23 +275,40 @@ func downloadAndTranscode(stream *StreamInfo) {
 	log.Printf("[%s] Baixando: %s (%.2f MB)", stream.ID[:8], stream.FileName, float64(videoFile.Length())/1024/1024)
 	log.Printf("[%s] Caminho do arquivo: %s", stream.ID[:8], stream.VideoFile)
 
-	// Configurar download sequencial para priorizar o início do arquivo
-	// Isso é importante para que o FFmpeg consiga ler os headers do vídeo
-	t.SetDisplayName(stream.FileName)
+	// IMPORTANTE: Para MKV/MP4, os headers estão no início do arquivo
+	// Precisamos baixar os primeiros MB de forma sequencial antes de iniciar transcodificação
 	
-	// Priorizar as primeiras peças do arquivo (headers)
-	// Baixar primeiros 5% primeiro para garantir headers
-	initialBytes := videoFile.Length() / 20 // 5%
-	if initialBytes < 10*1024*1024 {
-		initialBytes = 10 * 1024 * 1024 // Mínimo 10MB
-	}
+	// Iniciar download completo do arquivo
 	videoFile.Download()
+	
+	// Priorizar os primeiros 50MB para garantir que os headers estejam disponíveis
+	// Isso é crítico para o FFmpeg poder ler os metadados do arquivo
+	pieceLength := t.Info().PieceLength
+	initialPieces := (50 * 1024 * 1024) / int(pieceLength) // Primeiros 50MB em peças
+	if initialPieces < 10 {
+		initialPieces = 10
+	}
+	
+	// Obter o índice da primeira peça do arquivo de vídeo
+	fileOffset := videoFile.Offset()
+	firstPiece := int(fileOffset / int64(pieceLength))
+	
+	log.Printf("[%s] Priorizando primeiras %d peças (headers)...", stream.ID[:8], initialPieces)
+	
+	// Definir prioridade alta para as primeiras peças (headers do arquivo)
+	for i := 0; i < initialPieces; i++ {
+		pieceIndex := firstPiece + i
+		if pieceIndex < t.NumPieces() {
+			t.Piece(pieceIndex).SetPriority(torrent.PiecePriorityNow)
+		}
+	}
 
 	// Monitorar progresso do download
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	
 	transcodeStarted := false
+	headersReady := false
 
 	for {
 		select {
@@ -295,16 +326,50 @@ func downloadAndTranscode(stream *StreamInfo) {
 				float64(totalBytes)/1024/1024)
 
 			// Se baixou o suficiente para iniciar transcodificação
-			// Aguardar pelo menos 100MB ou 10% para garantir que headers foram baixados
-			minBytes := int64(100 * 1024 * 1024) // 100MB mínimo
-			if (progress >= 10 || bytesCompleted >= minBytes) && !transcodeStarted && stream.Status == "downloading" {
-				// Verificar se arquivo existe e tem tamanho razoável
-				if info, err := os.Stat(stream.VideoFile); err == nil && info.Size() > 10*1024*1024 {
-					log.Printf("[%s] Arquivo disponível com %.2f MB, iniciando transcodificação...", 
-						stream.ID[:8], float64(info.Size())/1024/1024)
-					transcodeStarted = true
-					stream.Status = "transcoding"
-					go transcodeToHLS(stream)
+			// Para arquivos grandes (>5GB), iniciar mais cedo
+			// Para arquivos pequenos, aguardar um pouco mais
+			minBytes := int64(50 * 1024 * 1024) // 50MB mínimo
+			minPercent := float64(2) // 2% mínimo
+			
+			// Para arquivos muito grandes (>10GB), ser mais agressivo
+			if totalBytes > 10*1024*1024*1024 {
+				minBytes = 30 * 1024 * 1024 // 30MB
+				minPercent = 0.5 // 0.5%
+			}
+			
+			// Verificar se os headers estão prontos (primeiras peças baixadas)
+			if !headersReady {
+				headersComplete := true
+				for i := 0; i < min(initialPieces, 5); i++ { // Verificar pelo menos as primeiras 5 peças
+					pieceIndex := firstPiece + i
+					if pieceIndex < t.NumPieces() {
+						piece := t.Piece(pieceIndex)
+						state := piece.State()
+						if !state.Complete {
+							headersComplete = false
+							break
+						}
+					}
+				}
+				if headersComplete {
+					headersReady = true
+					log.Printf("[%s] ✅ Headers prontos! Primeiras peças baixadas.", stream.ID[:8])
+				}
+			}
+			
+			if headersReady && (progress >= minPercent || bytesCompleted >= minBytes) && !transcodeStarted && stream.Status == "downloading" {
+				// Verificar se arquivo existe e se o FFmpeg consegue ler
+				if info, err := os.Stat(stream.VideoFile); err == nil && info.Size() > 20*1024*1024 {
+					// Verificar se o FFmpeg consegue ler o arquivo
+					if canReadVideoFile(stream.VideoFile) {
+						log.Printf("[%s] Arquivo válido com %.2f MB, iniciando transcodificação...", 
+							stream.ID[:8], float64(info.Size())/1024/1024)
+						transcodeStarted = true
+						stream.Status = "transcoding"
+						go transcodeToHLS(stream)
+					} else {
+						log.Printf("[%s] Aguardando mais dados... arquivo ainda não legível", stream.ID[:8])
+					}
 				}
 			}
 
@@ -440,19 +505,20 @@ func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
 		"-y",
 		"-fflags", "+genpts+igndts+discardcorrupt",
 		"-err_detect", "ignore_err",
-		"-analyzeduration", "20000000",
-		"-probesize", "100000000",
+		"-analyzeduration", "5000000", // Reduzido para 5 segundos
+		"-probesize", "50000000", // Reduzido para 50MB
 		"-i", stream.VideoFile,
-		// Filtro de escala com algoritmo de alta qualidade
-		"-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos", quality.Width, quality.Height),
+		// Filtro de escala com algoritmo rápido para inicio
+		"-vf", fmt.Sprintf("scale=%d:%d:flags=bilinear", quality.Width, quality.Height),
 		// Codec de vídeo H.264 otimizado
 		"-c:v", "libx264",
 		"-preset", quality.Preset,
+		"-tune", "zerolatency", // Reduz latência inicial
 		"-crf", fmt.Sprintf("%d", quality.CRF),
 		"-maxrate", quality.MaxBitrate,
 		"-bufsize", quality.BufSize,
-		"-profile:v", "high",
-		"-level", "4.1",
+		"-profile:v", "main", // Mais compatível e rápido
+		"-level", "4.0",
 		// Keyframes a cada 2 segundos para seek rápido
 		"-g", "48",
 		"-keyint_min", "48",
@@ -462,8 +528,8 @@ func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
 		"-b:a", quality.AudioRate,
 		"-ac", "2",
 		"-ar", "48000",
-		// Configurações HLS
-		"-hls_time", "4",
+		// Configurações HLS - segmentos menores para início rápido
+		"-hls_time", "2", // Segmentos de 2 segundos
 		"-hls_list_size", "0",
 		"-hls_flags", "independent_segments+append_list",
 		"-hls_segment_type", "mpegts",
@@ -599,6 +665,19 @@ func getVideoResolution(videoPath string) (int, int) {
 	return width, height
 }
 
+// canReadVideoFile verifica se o FFmpeg consegue ler o arquivo de vídeo
+func canReadVideoFile(videoPath string) bool {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		videoPath,
+	)
+	
+	err := cmd.Run()
+	return err == nil
+}
+
 // countSegmentsInDir conta segmentos .ts em um diretório
 func countSegmentsInDir(dir string) int {
 	files, err := os.ReadDir(dir)
@@ -645,9 +724,16 @@ func StopStream(id string) error {
 		}
 	}
 
-	// Remover torrent
+	// Remover torrent de forma segura
 	if stream.torrent != nil {
-		stream.torrent.Drop()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[%s] Torrent já fechado ao parar: %v", id[:8], r)
+				}
+			}()
+			stream.torrent.Drop()
+		}()
 	}
 
 	// Limpar arquivos
@@ -665,9 +751,22 @@ func CleanupAll() {
 	defer mu.Unlock()
 
 	for id, stream := range streams {
-		close(stream.cancelChan)
+		select {
+		case <-stream.cancelChan:
+			// Já fechado
+		default:
+			close(stream.cancelChan)
+		}
+		
 		if stream.torrent != nil {
-			stream.torrent.Drop()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[%s] Torrent já fechado em cleanup: %v", id[:8], r)
+					}
+				}()
+				stream.torrent.Drop()
+			}()
 		}
 		hlsDir := filepath.Join("./downloads", id)
 		os.RemoveAll(hlsDir)

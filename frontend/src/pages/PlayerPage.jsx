@@ -16,6 +16,9 @@ function PlayerPage() {
   const [error, setError] = useState(null)
   const [hlsUrl, setHlsUrl] = useState(null)
   const [currentQuality, setCurrentQuality] = useState(null)
+  const [downloadSpeed, setDownloadSpeed] = useState(0)
+  const [lastDownloadRate, setLastDownloadRate] = useState(0)
+  const [lastUpdateTime, setLastUpdateTime] = useState(null)
   
   const playerRef = useRef(null)
   const autoStarted = useRef(false)
@@ -64,6 +67,23 @@ function PlayerPage() {
         if (cancelled) return
         
         setStatus(data)
+        
+        // Calcular velocidade de download (MB/s)
+        if (data.downloadRate !== undefined) {
+          const now = Date.now()
+          if (lastUpdateTime && lastDownloadRate !== undefined) {
+            const timeDiff = (now - lastUpdateTime) / 1000 // segundos
+            if (timeDiff > 0) {
+              const byteDiff = (data.downloadRate - lastDownloadRate) // MB
+              const speed = byteDiff / timeDiff // MB/s
+              if (speed >= 0) {
+                setDownloadSpeed(speed)
+              }
+            }
+          }
+          setLastDownloadRate(data.downloadRate)
+          setLastUpdateTime(now)
+        }
 
         if (data.status === 'ready' && data.hlsUrl && !hlsUrl) {
           setHlsUrl(data.hlsUrl)
@@ -332,21 +352,34 @@ function PlayerPage() {
 
             {/* Informações extras */}
             {(status.status === 'downloading' || status.status === 'transcoding') && (
-              <div className="flex items-center gap-6 mt-4 text-sm text-white/80">
+              <div className="flex items-center gap-6 mt-4 text-sm text-white/80 flex-wrap">
                 <div className="flex items-center gap-2">
                   <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
                   </svg>
-                  <span>Peers: <span className={`font-mono ${status.peers > 0 ? 'text-green-300' : 'text-red-300'}`}>{status.peers || 0}</span></span>
+                  <span>Peers: <span className={`font-mono font-bold ${status.peers > 0 ? 'text-green-300' : 'text-red-300'}`}>{status.peers || 0}</span></span>
                 </div>
+                
+                {/* Velocidade de Download */}
+                <div className="flex items-center gap-2">
+                  <svg className="w-4 h-4 text-green-400" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                  </svg>
+                  <span>Velocidade: <span className={`font-mono font-bold ${downloadSpeed > 1 ? 'text-green-300' : downloadSpeed > 0.1 ? 'text-yellow-300' : 'text-red-300'}`}>
+                    {downloadSpeed >= 1 ? downloadSpeed.toFixed(2) : (downloadSpeed * 1024).toFixed(0)} {downloadSpeed >= 1 ? 'MB/s' : 'KB/s'}
+                  </span></span>
+                </div>
+                
+                {/* Total baixado */}
                 {status.downloadRate > 0 && (
                   <div className="flex items-center gap-2">
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                      <path d="M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm4 3H4V5h2v2zm-4 7h20v-4H2v4zm2-3h2v2H4v-2z"/>
                     </svg>
-                    <span>Download: <span className="font-mono">{status.downloadRate?.toFixed(2)} MB</span></span>
+                    <span>Baixado: <span className="font-mono">{status.downloadRate >= 1024 ? (status.downloadRate / 1024).toFixed(2) + ' GB' : status.downloadRate?.toFixed(1) + ' MB'}</span></span>
                   </div>
                 )}
+                
                 {currentQuality && (
                   <div className="flex items-center gap-2">
                     <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">

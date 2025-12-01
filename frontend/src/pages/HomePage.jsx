@@ -1,7 +1,31 @@
 import React, { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-const BRAZUCA_API = 'https://94c8cb9f702d-brazuca-torrents.baby-beamup.club'
+// Addons Stremio para buscar torrents
+const ADDONS = {
+  brazuca: {
+    id: 'brazuca',
+    name: '🇧🇷 Brazuca Torrents',
+    url: 'https://94c8cb9f702d-brazuca-torrents.baby-beamup.club',
+    color: 'bg-green-600',
+    description: 'Torrents brasileiros dublados e legendados'
+  },
+  torrentio: {
+    id: 'torrentio',
+    name: '🌐 Torrentio',
+    url: 'https://torrentio.strem.fun',
+    color: 'bg-purple-600',
+    description: 'Agregador de múltiplos trackers (YTS, RARBG, 1337x, TPB...)'
+  },
+  piratebay: {
+    id: 'piratebay',
+    name: '🏴‍☠️ ThePirateBay+',
+    url: 'https://thepiratebay-plus.strem.fun',
+    color: 'bg-yellow-600',
+    description: 'Busca direta no ThePirateBay'
+  }
+}
+
 // Usando Cinemeta API do Stremio (não requer autenticação)
 const CINEMETA_API = 'https://v3-cinemeta.strem.io'
 
@@ -15,6 +39,8 @@ function HomePage() {
   const [selectedItem, setSelectedItem] = useState(null)
   const [streams, setStreams] = useState([])
   const [error, setError] = useState(null)
+  const [activeAddons, setActiveAddons] = useState(['brazuca', 'torrentio', 'piratebay'])
+  const [loadingAddons, setLoadingAddons] = useState({})
 
   // Carregar filmes em alta ao iniciar
   useEffect(() => {
@@ -114,10 +140,10 @@ function HomePage() {
     setSelectedItem(item)
     setStreams([])
     setLoadingStreams(item.id)
+    setLoadingAddons({})
     setError(null)
 
     try {
-      // O item já tem o IMDB ID
       const imdbId = item.imdb_id || item.id
       if (!imdbId || !imdbId.startsWith('tt')) {
         setError('IMDB ID não encontrado para este título')
@@ -127,18 +153,71 @@ function HomePage() {
 
       const type = item.media_type === 'movie' ? 'movie' : 'series'
       
-      // Buscar streams no Brazuca
-      const streamRes = await fetch(`${BRAZUCA_API}/stream/${type}/${imdbId}.json`)
-      const streamData = await streamRes.json()
-
-      if (streamData.streams && streamData.streams.length > 0) {
-        // Ordenar por seeders (se disponível) e qualidade
-        const sortedStreams = streamData.streams
-          .filter(s => s.infoHash || s.url?.includes('magnet'))
-          .slice(0, 15)
-        setStreams(sortedStreams)
+      // Buscar streams de todos os addons ativos em paralelo
+      const allStreams = []
+      
+      const fetchPromises = activeAddons.map(async (addonId) => {
+        const addon = ADDONS[addonId]
+        if (!addon) return []
+        
+        setLoadingAddons(prev => ({ ...prev, [addonId]: true }))
+        
+        try {
+          const streamRes = await fetch(`${addon.url}/stream/${type}/${imdbId}.json`, {
+            signal: AbortSignal.timeout(10000) // 10s timeout
+          })
+          
+          if (!streamRes.ok) {
+            console.log(`${addon.name}: Sem resultados`)
+            return []
+          }
+          
+          const streamData = await streamRes.json()
+          
+          const streams = (streamData.streams || [])
+            .filter(s => s.infoHash || s.url?.includes('magnet'))
+            .map(s => ({
+              ...s,
+              addonId: addonId,
+              addonName: addon.name,
+              addonColor: addon.color
+            }))
+          
+          console.log(`${addon.name}: ${streams.length} torrents`)
+          return streams
+        } catch (err) {
+          console.log(`${addon.name}: Erro - ${err.message}`)
+          return []
+        } finally {
+          setLoadingAddons(prev => ({ ...prev, [addonId]: false }))
+        }
+      })
+      
+      const results = await Promise.all(fetchPromises)
+      results.forEach(streams => allStreams.push(...streams))
+      
+      if (allStreams.length > 0) {
+        // Ordenar: Brazuca primeiro (dublados), depois por qualidade
+        const sortedStreams = allStreams.sort((a, b) => {
+          // Priorizar Brazuca (conteúdo brasileiro)
+          if (a.addonId === 'brazuca' && b.addonId !== 'brazuca') return -1
+          if (b.addonId === 'brazuca' && a.addonId !== 'brazuca') return 1
+          
+          // Depois por qualidade
+          const qualityOrder = { '4k': 4, '2160p': 4, '1080p': 3, '720p': 2, '480p': 1 }
+          const getQuality = (stream) => {
+            const title = (stream.title || stream.name || '').toLowerCase()
+            for (const [q, v] of Object.entries(qualityOrder)) {
+              if (title.includes(q)) return v
+            }
+            return 0
+          }
+          return getQuality(b) - getQuality(a)
+        })
+        
+        setStreams(sortedStreams.slice(0, 30))
       } else {
-        setError('Nenhum torrent encontrado para este título')
+        setError('Nenhum torrent encontrado em nenhum addon')
       }
     } catch (err) {
       setError('Erro ao buscar streams')
@@ -268,6 +347,31 @@ function HomePage() {
               🔗 Magnet Link
             </button>
           </div>
+          
+          {/* Addon Toggles */}
+          <div className="flex items-center gap-2 mt-3 flex-wrap">
+            <span className="text-sm text-gray-400">Fontes:</span>
+            {Object.values(ADDONS).map(addon => (
+              <button
+                key={addon.id}
+                onClick={() => {
+                  setActiveAddons(prev => 
+                    prev.includes(addon.id) 
+                      ? prev.filter(id => id !== addon.id)
+                      : [...prev, addon.id]
+                  )
+                }}
+                className={`px-3 py-1 rounded-full text-xs font-medium transition-all ${
+                  activeAddons.includes(addon.id)
+                    ? `${addon.color} text-white`
+                    : 'bg-gray-700 text-gray-400 hover:bg-gray-600'
+                }`}
+                title={addon.description}
+              >
+                {addon.name}
+              </button>
+            ))}
+          </div>
         </div>
       </header>
 
@@ -347,9 +451,30 @@ function HomePage() {
 
               {/* Loading */}
               {loadingStreams && (
-                <div className="flex items-center justify-center py-8">
-                  <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent"></div>
-                  <span className="ml-3 text-gray-400">Buscando torrents...</span>
+                <div className="py-6">
+                  <div className="flex items-center justify-center mb-4">
+                    <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent"></div>
+                    <span className="ml-3 text-gray-400">Buscando torrents...</span>
+                  </div>
+                  {/* Status dos addons */}
+                  <div className="flex items-center justify-center gap-3 flex-wrap">
+                    {Object.values(ADDONS).filter(a => activeAddons.includes(a.id)).map(addon => (
+                      <div 
+                        key={addon.id}
+                        className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs ${
+                          loadingAddons[addon.id] 
+                            ? 'bg-gray-700 text-white' 
+                            : 'bg-gray-800 text-gray-500'
+                        }`}
+                      >
+                        {loadingAddons[addon.id] && (
+                          <div className="animate-spin rounded-full h-3 w-3 border border-white border-t-transparent"></div>
+                        )}
+                        {!loadingAddons[addon.id] && <span>✓</span>}
+                        {addon.name}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -376,6 +501,12 @@ function HomePage() {
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="flex-1 min-w-0">
+                            {/* Badge do Addon */}
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className={`px-2 py-0.5 ${stream.addonColor} rounded text-xs`}>
+                                {stream.addonName?.replace(/[🇧🇷🌐🏴‍☠️]/g, '').trim()}
+                              </span>
+                            </div>
                             <p className="text-sm text-white truncate group-hover:text-blue-400 transition-colors">
                               {title || 'Stream disponível'}
                             </p>
