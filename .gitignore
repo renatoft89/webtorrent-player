@@ -1,0 +1,31 @@
+# Dependências
+node_modules/
+vendor/
+
+# Build
+dist/
+build/
+*.exe
+
+# Downloads de torrent
+downloads/
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.docker/
+
+# Go
+*.test
+*.out

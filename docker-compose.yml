@@ -1,0 +1,31 @@
+services:
+  backend:
+    build: ./backend
+    container_name: webtorrent-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - downloads:/app/downloads
+    environment:
+      - PORT=8080
+    networks:
+      - webtorrent-net
+
+  frontend:
+    build: ./frontend
+    container_name: webtorrent-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    networks:
+      - webtorrent-net
+
+volumes:
+  downloads:
+
+networks:
+  webtorrent-net:
+    driver: bridge
