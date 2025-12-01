@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -21,20 +22,45 @@ var (
 	maxStreams = 2 // Máximo de streams simultâneos
 )
 
+// QualityLevel define uma qualidade de vídeo para ABR
+type QualityLevel struct {
+	Name       string // 360p, 480p, 720p, 1080p
+	Width      int
+	Height     int
+	Bitrate    string // ex: "1000k"
+	MaxBitrate string // ex: "1200k"
+	BufSize    string // ex: "2000k"
+	AudioRate  string // ex: "96k", "128k"
+	CRF        int    // Qualidade (menor = melhor)
+	Preset     string // ultrafast, veryfast, fast, medium
+}
+
+// Níveis de qualidade estilo Netflix
+var qualityLevels = []QualityLevel{
+	{Name: "360p", Width: 640, Height: 360, Bitrate: "800k", MaxBitrate: "856k", BufSize: "1200k", AudioRate: "96k", CRF: 28, Preset: "veryfast"},
+	{Name: "480p", Width: 854, Height: 480, Bitrate: "1400k", MaxBitrate: "1498k", BufSize: "2100k", AudioRate: "128k", CRF: 26, Preset: "veryfast"},
+	{Name: "720p", Width: 1280, Height: 720, Bitrate: "2800k", MaxBitrate: "2996k", BufSize: "4200k", AudioRate: "128k", CRF: 24, Preset: "fast"},
+	{Name: "1080p", Width: 1920, Height: 1080, Bitrate: "5000k", MaxBitrate: "5350k", BufSize: "7500k", AudioRate: "192k", CRF: 22, Preset: "fast"},
+}
+
 type StreamInfo struct {
-	ID           string    `json:"id"`
-	MagnetLink   string    `json:"magnetLink"`
-	Status       string    `json:"status"` // downloading, transcoding, ready, error
-	Progress     float64   `json:"progress"`
-	FileName     string    `json:"fileName"`
-	VideoFile    string    `json:"videoFile"`
-	HLSPath      string    `json:"hlsPath"`
-	Error        string    `json:"error,omitempty"`
-	Peers        int       `json:"peers"`
-	DownloadRate float64   `json:"downloadRate"` // bytes por segundo
-	CreatedAt    time.Time `json:"createdAt"`
-	torrent      *torrent.Torrent
-	cancelChan   chan struct{}
+	ID             string          `json:"id"`
+	MagnetLink     string          `json:"magnetLink"`
+	Status         string          `json:"status"` // downloading, transcoding, ready, error
+	Progress       float64         `json:"progress"`
+	FileName       string          `json:"fileName"`
+	VideoFile      string          `json:"videoFile"`
+	HLSPath        string          `json:"hlsPath"`
+	Error          string          `json:"error,omitempty"`
+	Peers          int             `json:"peers"`
+	DownloadRate   float64         `json:"downloadRate"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	Qualities      []string        `json:"qualities"` // Qualidades disponíveis
+	SourceWidth    int             `json:"sourceWidth"`
+	SourceHeight   int             `json:"sourceHeight"`
+	torrent        *torrent.Torrent
+	cancelChan     chan struct{}
+	ffmpegProcs    []*exec.Cmd
 }
 
 // GetPeerStats retorna estatísticas de peers do torrent
@@ -300,7 +326,6 @@ func transcodeToHLS(stream *StreamInfo) {
 	}
 
 	stream.HLSPath = hlsDir
-	playlistPath := filepath.Join(hlsDir, "playlist.m3u8")
 
 	// Aguardar arquivo existir e ter tamanho mínimo
 	for i := 0; i < 60; i++ {
@@ -310,87 +335,272 @@ func transcodeToHLS(stream *StreamInfo) {
 		time.Sleep(time.Second)
 	}
 
-	// Tentar transcodificação com retry
-	maxRetries := 5
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			log.Printf("[%s] Tentativa %d de transcodificação...", stream.ID[:8], retry+1)
-			time.Sleep(5 * time.Second) // Aguardar mais dados
+	// Detectar resolução do vídeo fonte
+	sourceWidth, sourceHeight := getVideoResolution(stream.VideoFile)
+	stream.SourceWidth = sourceWidth
+	stream.SourceHeight = sourceHeight
+	log.Printf("[%s] Resolução fonte: %dx%d", stream.ID[:8], sourceWidth, sourceHeight)
+
+	// Determinar quais qualidades gerar baseado na resolução fonte
+	// Não faz sentido gerar 1080p se o vídeo fonte é 720p
+	availableQualities := []QualityLevel{}
+	for _, q := range qualityLevels {
+		if q.Height <= sourceHeight {
+			availableQualities = append(availableQualities, q)
 		}
-
-		log.Printf("[%s] Iniciando transcodificação HLS...", stream.ID[:8])
-
-		// Comando FFmpeg para transcodificar para H.264 (compatível com todos os navegadores)
-		// x265/HEVC não é suportado nativamente em Chrome/Firefox
-		cmd := exec.Command("ffmpeg",
-			"-y",
-			"-fflags", "+genpts+igndts+discardcorrupt",
-			"-err_detect", "ignore_err",
-			"-analyzeduration", "10000000",
-			"-probesize", "50000000",
-			"-i", stream.VideoFile,
-			"-c:v", "libx264",       // Sempre transcodificar para H.264
-			"-preset", "veryfast",   // Preset rápido
-			"-crf", "23",            // Qualidade boa
-			"-c:a", "aac",
-			"-b:a", "128k",
-			"-ac", "2",              // Stereo
-			"-hls_time", "4",
-			"-hls_list_size", "0",
-			"-hls_flags", "append_list+omit_endlist",
-			"-hls_segment_type", "mpegts",
-			"-start_number", "0",
-			"-f", "hls",
-			playlistPath,
-		)
-
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Start(); err != nil {
-			log.Printf("[%s] Erro ao iniciar FFmpeg: %v", stream.ID[:8], err)
-			continue
-		}
-
-		// Aguardar playlist ser criada (com timeout)
-		playlistCreated := false
-		for i := 0; i < 30; i++ {
-			if _, err := os.Stat(playlistPath); err == nil {
-				segmentCount := countSegments(hlsDir)
-				if segmentCount >= 2 {
-					playlistCreated = true
-					stream.Status = "ready"
-					log.Printf("[%s] Stream HLS pronto! (%d segmentos)", stream.ID[:8], segmentCount)
-					break
-				}
-			}
-			time.Sleep(time.Second)
-		}
-
-		if playlistCreated {
-			// Sucesso! Aguardar FFmpeg terminar ou stream ser cancelado
-			go func() {
-				select {
-				case <-stream.cancelChan:
-					cmd.Process.Kill()
-				}
-			}()
-			cmd.Wait()
-			return
-		}
-
-		// Falhou, matar processo e tentar novamente
-		cmd.Process.Kill()
-		cmd.Wait()
-		log.Printf("[%s] FFmpeg falhou, tentando novamente...", stream.ID[:8])
+	}
+	
+	// Se nenhuma qualidade se encaixa, usar a menor
+	if len(availableQualities) == 0 {
+		availableQualities = []QualityLevel{qualityLevels[0]}
 	}
 
-	stream.Status = "error"
-	stream.Error = "Falha ao transcodificar após múltiplas tentativas"
+	log.Printf("[%s] Gerando %d qualidades: %v", stream.ID[:8], len(availableQualities), 
+		func() []string {
+			names := make([]string, len(availableQualities))
+			for i, q := range availableQualities {
+				names[i] = q.Name
+			}
+			return names
+		}())
+
+	// Iniciar transcodificação para cada qualidade em paralelo
+	var wg sync.WaitGroup
+	qualitiesReady := make(chan string, len(availableQualities))
+	errors := make(chan error, len(availableQualities))
+
+	for _, quality := range availableQualities {
+		wg.Add(1)
+		go func(q QualityLevel) {
+			defer wg.Done()
+			err := transcodeQuality(stream, q)
+			if err != nil {
+				errors <- fmt.Errorf("%s: %v", q.Name, err)
+			} else {
+				qualitiesReady <- q.Name
+			}
+		}(quality)
+	}
+
+	// Aguardar pelo menos uma qualidade ficar pronta
+	go func() {
+		firstReady := false
+		readyQualities := []string{}
+		
+		for {
+			select {
+			case q := <-qualitiesReady:
+				readyQualities = append(readyQualities, q)
+				stream.Qualities = readyQualities
+				
+				if !firstReady {
+					firstReady = true
+					// Gerar master playlist assim que a primeira qualidade estiver pronta
+					if err := generateMasterPlaylist(stream, availableQualities); err != nil {
+						log.Printf("[%s] Erro ao gerar master playlist: %v", stream.ID[:8], err)
+					} else {
+						stream.Status = "ready"
+						log.Printf("[%s] 🎬 Stream ABR pronto! Qualidade inicial: %s", stream.ID[:8], q)
+					}
+				} else {
+					// Atualizar master playlist com nova qualidade
+					generateMasterPlaylist(stream, availableQualities)
+					log.Printf("[%s] ✅ Qualidade %s adicionada", stream.ID[:8], q)
+				}
+				
+			case err := <-errors:
+				log.Printf("[%s] ⚠️ Erro em qualidade: %v", stream.ID[:8], err)
+				
+			case <-stream.cancelChan:
+				return
+			}
+		}
+	}()
+
+	// Aguardar todas terminarem
+	wg.Wait()
 }
 
-// countSegments conta quantos arquivos .ts existem no diretório
-func countSegments(dir string) int {
+// transcodeQuality transcodifica para uma qualidade específica
+func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
+	qualityDir := filepath.Join(stream.HLSPath, quality.Name)
+	if err := os.MkdirAll(qualityDir, 0755); err != nil {
+		return err
+	}
+
+	playlistPath := filepath.Join(qualityDir, "playlist.m3u8")
+	segmentPath := filepath.Join(qualityDir, "segment%03d.ts")
+
+	log.Printf("[%s] Iniciando transcodificação %s (%dx%d @ %s)...", 
+		stream.ID[:8], quality.Name, quality.Width, quality.Height, quality.Bitrate)
+
+	// FFmpeg otimizado estilo Netflix
+	// Usando 2-pass seria ideal mas muito lento, então usamos CRF com maxrate
+	args := []string{
+		"-y",
+		"-fflags", "+genpts+igndts+discardcorrupt",
+		"-err_detect", "ignore_err",
+		"-analyzeduration", "20000000",
+		"-probesize", "100000000",
+		"-i", stream.VideoFile,
+		// Filtro de escala com algoritmo de alta qualidade
+		"-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos", quality.Width, quality.Height),
+		// Codec de vídeo H.264 otimizado
+		"-c:v", "libx264",
+		"-preset", quality.Preset,
+		"-crf", fmt.Sprintf("%d", quality.CRF),
+		"-maxrate", quality.MaxBitrate,
+		"-bufsize", quality.BufSize,
+		"-profile:v", "high",
+		"-level", "4.1",
+		// Keyframes a cada 2 segundos para seek rápido
+		"-g", "48",
+		"-keyint_min", "48",
+		"-sc_threshold", "0",
+		// Codec de áudio AAC otimizado
+		"-c:a", "aac",
+		"-b:a", quality.AudioRate,
+		"-ac", "2",
+		"-ar", "48000",
+		// Configurações HLS
+		"-hls_time", "4",
+		"-hls_list_size", "0",
+		"-hls_flags", "independent_segments+append_list",
+		"-hls_segment_type", "mpegts",
+		"-hls_segment_filename", segmentPath,
+		"-f", "hls",
+		playlistPath,
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	
+	// Log de erros do FFmpeg
+	cmd.Stderr = os.Stderr
+
+	// Adicionar à lista de processos do stream
+	mu.Lock()
+	stream.ffmpegProcs = append(stream.ffmpegProcs, cmd)
+	mu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("erro ao iniciar FFmpeg: %v", err)
+	}
+
+	// Aguardar pelo menos 2 segmentos serem criados
+	for i := 0; i < 60; i++ {
+		select {
+		case <-stream.cancelChan:
+			cmd.Process.Kill()
+			return fmt.Errorf("cancelado")
+		default:
+		}
+
+		if countSegmentsInDir(qualityDir) >= 2 {
+			log.Printf("[%s] %s: primeiros segmentos prontos", stream.ID[:8], quality.Name)
+			
+			// Continuar rodando em background
+			go func() {
+				cmd.Wait()
+				log.Printf("[%s] %s: transcodificação completa", stream.ID[:8], quality.Name)
+			}()
+			
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+
+	cmd.Process.Kill()
+	return fmt.Errorf("timeout aguardando segmentos")
+}
+
+// generateMasterPlaylist gera o master playlist HLS com todas as qualidades
+func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error {
+	masterPath := filepath.Join(stream.HLSPath, "master.m3u8")
+
+	// Template do master playlist
+	const masterTemplate = `#EXTM3U
+#EXT-X-VERSION:3
+{{range .Qualities}}
+#EXT-X-STREAM-INF:BANDWIDTH={{.Bandwidth}},RESOLUTION={{.Width}}x{{.Height}},NAME="{{.Name}}"
+{{.Name}}/playlist.m3u8
+{{end}}`
+
+	type PlaylistQuality struct {
+		Name      string
+		Width     int
+		Height    int
+		Bandwidth int
+	}
+
+	// Verificar quais qualidades realmente têm playlist
+	var availableQualities []PlaylistQuality
+	for _, q := range qualities {
+		playlistPath := filepath.Join(stream.HLSPath, q.Name, "playlist.m3u8")
+		if _, err := os.Stat(playlistPath); err == nil {
+			// Converter bitrate string para int (ex: "2800k" -> 2800000)
+			bitrateStr := strings.TrimSuffix(q.Bitrate, "k")
+			var bitrate int
+			fmt.Sscanf(bitrateStr, "%d", &bitrate)
+			bitrate *= 1000
+			
+			availableQualities = append(availableQualities, PlaylistQuality{
+				Name:      q.Name,
+				Width:     q.Width,
+				Height:    q.Height,
+				Bandwidth: bitrate,
+			})
+		}
+	}
+
+	if len(availableQualities) == 0 {
+		return fmt.Errorf("nenhuma qualidade disponível")
+	}
+
+	// Gerar master playlist
+	tmpl, err := template.New("master").Parse(masterTemplate)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(masterPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return tmpl.Execute(f, map[string]interface{}{
+		"Qualities": availableQualities,
+	})
+}
+
+// getVideoResolution obtém a resolução do vídeo usando ffprobe
+func getVideoResolution(videoPath string) (int, int) {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=width,height",
+		"-of", "csv=s=x:p=0",
+		videoPath,
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Erro ao obter resolução: %v", err)
+		return 1920, 1080 // Assumir 1080p por padrão
+	}
+
+	var width, height int
+	fmt.Sscanf(strings.TrimSpace(string(output)), "%dx%d", &width, &height)
+	
+	if width == 0 || height == 0 {
+		return 1920, 1080
+	}
+	
+	return width, height
+}
+
+// countSegmentsInDir conta segmentos .ts em um diretório
+func countSegmentsInDir(dir string) int {
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return 0
@@ -421,7 +631,19 @@ func StopStream(id string) error {
 	}
 
 	// Sinalizar cancelamento
-	close(stream.cancelChan)
+	select {
+	case <-stream.cancelChan:
+		// Já fechado
+	default:
+		close(stream.cancelChan)
+	}
+
+	// Matar processos FFmpeg
+	for _, cmd := range stream.ffmpegProcs {
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+	}
 
 	// Remover torrent
 	if stream.torrent != nil {

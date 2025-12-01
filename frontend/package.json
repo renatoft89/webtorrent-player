@@ -12,7 +12,8 @@
     "hls.js": "^1.5.7",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-router-dom": "^7.9.6"
+    "react-router-dom": "^7.9.6",
+    "shaka-player": "^4.16.10"
   },
   "devDependencies": {
     "@types/react": "^18.2.55",

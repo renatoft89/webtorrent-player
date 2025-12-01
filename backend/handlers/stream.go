@@ -62,11 +62,14 @@ func GetStreamStatus(c *gin.Context) {
 		"error":        stream.Error,
 		"peers":        peers,
 		"downloadRate": downloadRate,
-		"hlsUrl":       "/api/stream/" + stream.ID + "/playlist.m3u8",
+		"qualities":    stream.Qualities,
+		"sourceWidth":  stream.SourceWidth,
+		"sourceHeight": stream.SourceHeight,
+		"hlsUrl":       "/api/stream/" + stream.ID + "/master.m3u8",
 	})
 }
 
-// GetPlaylist retorna a playlist HLS
+// GetPlaylist retorna a playlist HLS (master ou de qualidade específica)
 func GetPlaylist(c *gin.Context) {
 	id := c.Param("id")
 
@@ -81,10 +84,34 @@ func GetPlaylist(c *gin.Context) {
 		return
 	}
 
-	playlistPath := filepath.Join(stream.HLSPath, "playlist.m3u8")
+	// Tentar master playlist primeiro
+	playlistPath := filepath.Join(stream.HLSPath, "master.m3u8")
 	
 	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Playlist ainda não gerada"})
+		return
+	}
+
+	c.Header("Content-Type", "application/vnd.apple.mpegurl")
+	c.Header("Cache-Control", "no-cache")
+	c.File(playlistPath)
+}
+
+// GetQualityPlaylist retorna a playlist de uma qualidade específica
+func GetQualityPlaylist(c *gin.Context) {
+	id := c.Param("id")
+	quality := c.Param("quality")
+
+	stream, ok := torrent.GetStream(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Stream não encontrado"})
+		return
+	}
+
+	playlistPath := filepath.Join(stream.HLSPath, quality, "playlist.m3u8")
+	
+	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Qualidade não encontrada"})
 		return
 	}
 
@@ -104,7 +131,32 @@ func GetSegment(c *gin.Context) {
 		return
 	}
 
+	// Verificar se é um segmento de qualidade específica (ex: 720p/segment001.ts)
 	segmentPath := filepath.Join(stream.HLSPath, segment)
+	
+	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Segmento não encontrado"})
+		return
+	}
+
+	c.Header("Content-Type", "video/mp2t")
+	c.Header("Cache-Control", "max-age=3600")
+	c.File(segmentPath)
+}
+
+// GetQualitySegment retorna um segmento de qualidade específica
+func GetQualitySegment(c *gin.Context) {
+	id := c.Param("id")
+	quality := c.Param("quality")
+	segment := c.Param("segment")
+
+	stream, ok := torrent.GetStream(id)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Stream não encontrado"})
+		return
+	}
+
+	segmentPath := filepath.Join(stream.HLSPath, quality, segment)
 	
 	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Segmento não encontrado"})

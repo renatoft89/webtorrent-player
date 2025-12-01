@@ -42,8 +42,12 @@ func main() {
 	{
 		api.POST("/stream", handlers.StartStream)
 		api.GET("/stream/:id/status", handlers.GetStreamStatus)
-		api.GET("/stream/:id/playlist.m3u8", handlers.GetPlaylist)
-		api.GET("/stream/:id/:segment", handlers.GetSegment)
+		// Master playlist (ABR)
+		api.GET("/stream/:id/master.m3u8", handlers.GetPlaylist)
+		// Playlist de qualidade específica
+		api.GET("/stream/:id/:quality/playlist.m3u8", handlers.GetQualityPlaylist)
+		// Segmentos de qualidade específica (usando * para capturar subpath)
+		api.GET("/stream/:id/:quality/:segment", handlers.GetQualitySegment)
 		api.DELETE("/stream/:id", handlers.StopStream)
 	}
 
