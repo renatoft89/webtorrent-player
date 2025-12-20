@@ -93,27 +93,39 @@ const ShakaVideoPlayer = forwardRef(({
         playerRef.current = player
         currentSrcRef.current = src
 
-        // Configuração otimizada para streaming
+        // Configuração otimizada para streaming com ABR inteligente
         player.configure({
           streaming: {
-            bufferingGoal: 60,
+            bufferingGoal: 30,
             rebufferingGoal: 2,
             bufferBehind: 30,
             retryParameters: {
               maxAttempts: 5,
-              baseDelay: 1000,
+              baseDelay: 500,
               backoffFactor: 2,
-              fuzzFactor: 0.5
-            }
+              fuzzFactor: 0.3
+            },
+            startAtSegmentBoundary: false
           },
           abr: {
             enabled: true,
-            defaultBandwidthEstimate: 1000000,
-            switchInterval: 8,
-            bandwidthUpgradeTarget: 0.85,
-            bandwidthDowngradeTarget: 0.95
+            // Estimativa inicial alta (10 Mbps) - assumir boa conexão
+            defaultBandwidthEstimate: 10000000,
+            // Switch rápido (a cada 2 segundos avaliar)
+            switchInterval: 2,
+            // Subir de qualidade quando tiver 60% de margem
+            bandwidthUpgradeTarget: 0.6,
+            // Descer apenas quando estiver muito apertado (95%)
+            bandwidthDowngradeTarget: 0.95,
+            // Não restringir por tamanho - deixar ABR decidir
+            restrictToElementSize: false,
+            restrictToScreenSize: false,
+            // Usar histórico de bandwidth para decisões melhores
+            useNetworkInformation: true
           }
         })
+        
+        console.log('🎬 Shaka Player configurado com ABR inteligente')
 
         // Event listeners
         player.addEventListener('error', (event) => {
@@ -130,6 +142,7 @@ const ShakaVideoPlayer = forwardRef(({
           const tracks = player.getVariantTracks()
           const active = tracks.find(t => t.active)
           if (active) {
+            console.log(`🔄 ABR mudou para: ${active.height}p (bandwidth: ${(active.bandwidth/1000000).toFixed(2)} Mbps)`)
             setCurrentQuality(`${active.height}p`)
             onQualityChange?.(active)
           }
@@ -139,6 +152,7 @@ const ShakaVideoPlayer = forwardRef(({
           const tracks = player.getVariantTracks()
           const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
           setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
+          console.log('📊 Qualidades disponíveis:', uniqueHeights.map(h => `${h}p`).join(', '))
           
           // Atualizar faixas de áudio
           updateAudioTracks(player)
@@ -156,11 +170,24 @@ const ShakaVideoPlayer = forwardRef(({
         const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
         setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
         
+        // Log detalhado das tracks
+        console.log('📺 Variant tracks encontradas:', tracks.length)
+        tracks.forEach(t => {
+          console.log(`  - ${t.height}p: bandwidth=${t.bandwidth}, active=${t.active}`)
+        })
+        
+        // Se houver qualidades altas disponíveis, tentar selecionar a melhor
+        if (tracks.length > 1) {
+          const highestTrack = tracks.reduce((a, b) => (a.height > b.height ? a : b))
+          console.log(`🎯 Maior qualidade disponível: ${highestTrack.height}p`)
+        }
+        
         // Configurar faixas de áudio
         updateAudioTracks(player)
         
         // Configurar legendas
-        updateTextTracks(player)        
+        updateTextTracks(player)
+        
         // Tentar autoplay após um pequeno delay
         if (autoPlay && videoRef.current) {
           setTimeout(async () => {
@@ -349,20 +376,39 @@ const ShakaVideoPlayer = forwardRef(({
 
   const changeQuality = useCallback((quality) => {
     const player = playerRef.current
-    if (!player) return
+    if (!player) {
+      console.warn('⚠️ Player não disponível para mudar qualidade')
+      return
+    }
 
+    console.log(`🔄 Mudando qualidade para: ${quality}`)
     setCurrentQuality(quality)
     setShowSettings(false)
 
     if (quality === 'auto') {
       player.configure({ abr: { enabled: true } })
+      console.log('✅ ABR automático ativado')
     } else {
       const height = parseInt(quality)
       player.configure({ abr: { enabled: false } })
       const tracks = player.getVariantTracks()
+      console.log(`📊 Tracks disponíveis:`, tracks.map(t => `${t.height}p`).join(', '))
+      
       const track = tracks.find(t => t.height === height)
       if (track) {
         player.selectVariantTrack(track, true)
+        console.log(`✅ Qualidade ${height}p selecionada (bandwidth: ${track.bandwidth})`)
+      } else {
+        console.warn(`⚠️ Track ${height}p não encontrada. Disponíveis:`, tracks.map(t => t.height))
+        // Tentar encontrar a qualidade mais próxima
+        const closest = tracks.reduce((prev, curr) => 
+          Math.abs(curr.height - height) < Math.abs(prev.height - height) ? curr : prev
+        )
+        if (closest) {
+          player.selectVariantTrack(closest, true)
+          setCurrentQuality(`${closest.height}p`)
+          console.log(`🔄 Usando qualidade mais próxima: ${closest.height}p`)
+        }
       }
     }
   }, [])

@@ -52,7 +52,7 @@ func GetStreamStatus(c *gin.Context) {
 		return
 	}
 
-	peers, downloadRate := stream.GetPeerStats()
+	peers, downloaded, speed := stream.GetPeerStats()
 	
 	c.JSON(http.StatusOK, gin.H{
 		"id":           stream.ID,
@@ -61,7 +61,8 @@ func GetStreamStatus(c *gin.Context) {
 		"fileName":     stream.FileName,
 		"error":        stream.Error,
 		"peers":        peers,
-		"downloadRate": downloadRate,
+		"downloaded":   downloaded,   // Total baixado em MB
+		"speed":        speed,        // Velocidade instantânea em MB/s
 		"qualities":    stream.Qualities,
 		"sourceWidth":  stream.SourceWidth,
 		"sourceHeight": stream.SourceHeight,

@@ -21,8 +21,8 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Instalar FFmpeg
-RUN apk add --no-cache ffmpeg ca-certificates
+# Instalar FFmpeg com suporte a hardware acceleration (VAAPI)
+RUN apk add --no-cache ffmpeg ca-certificates libva libva-intel-driver mesa-va-gallium
 
 # Copiar binário
 COPY --from=builder /app/server .

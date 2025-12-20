@@ -9,6 +9,9 @@ services:
       - downloads:/app/downloads
     environment:
       - PORT=8080
+    # Hardware acceleration support (VAAPI) - opcional
+    devices:
+      - /dev/dri:/dev/dri
     networks:
       - webtorrent-net
 
