@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from 'react'
 import shaka from 'shaka-player'
 
-const ShakaVideoPlayer = forwardRef(({ 
-  src, 
+const ShakaVideoPlayer = forwardRef(({
+  src,
   poster,
   onReady,
   onError,
@@ -10,14 +10,14 @@ const ShakaVideoPlayer = forwardRef(({
   onTimeUpdate,
   onQualityChange,
   autoPlay = true,
-  muted = true 
+  muted = true
 }, ref) => {
   const videoRef = useRef(null)
   const containerRef = useRef(null)
   const playerRef = useRef(null)
   const initializingRef = useRef(false)
   const currentSrcRef = useRef(null)
-  
+
   const [isPlaying, setIsPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -32,13 +32,13 @@ const ShakaVideoPlayer = forwardRef(({
   const [showSettings, setShowSettings] = useState(false)
   const [settingsTab, setSettingsTab] = useState('quality') // 'quality', 'audio', 'subtitles', 'speed'
   const [isBuffering, setIsBuffering] = useState(false)
-  
+
   // Faixas de áudio e legendas
   const [audioTracks, setAudioTracks] = useState([])
   const [currentAudioTrack, setCurrentAudioTrack] = useState(null)
   const [textTracks, setTextTracks] = useState([])
   const [currentTextTrack, setCurrentTextTrack] = useState(null)
-  
+
   const controlsTimeoutRef = useRef(null)
 
   // Expor métodos via ref
@@ -58,11 +58,11 @@ const ShakaVideoPlayer = forwardRef(({
   // Inicializar Shaka Player - apenas quando src muda
   useEffect(() => {
     if (!src || !videoRef.current) return
-    
+
     // Evitar inicialização duplicada
     if (initializingRef.current) return
     if (currentSrcRef.current === src) return
-    
+
     initializingRef.current = true
 
     const initPlayer = async () => {
@@ -101,6 +101,9 @@ const ShakaVideoPlayer = forwardRef(({
             bufferBehind: 30,
             retryParameters: {
               maxAttempts: 5,
+              // HLS multi-qualidade pode demorar para criar a primeira playlist/segmento
+              // (especialmente em software encoding). Evita abortar cedo.
+              timeout: 120000,
               baseDelay: 500,
               backoffFactor: 2,
               fuzzFactor: 0.3
@@ -109,8 +112,8 @@ const ShakaVideoPlayer = forwardRef(({
           },
           abr: {
             enabled: true,
-            // Estimativa inicial alta (10 Mbps) - assumir boa conexão
-            defaultBandwidthEstimate: 10000000,
+            // Estimativa inicial conservadora (500 kbps) para garantir início rápido com a qualidade base
+            defaultBandwidthEstimate: 500000,
             // Switch rápido (a cada 2 segundos avaliar)
             switchInterval: 2,
             // Subir de qualidade quando tiver 60% de margem
@@ -124,7 +127,7 @@ const ShakaVideoPlayer = forwardRef(({
             useNetworkInformation: true
           }
         })
-        
+
         console.log('🎬 Shaka Player configurado com ABR inteligente')
 
         // Event listeners
@@ -142,7 +145,7 @@ const ShakaVideoPlayer = forwardRef(({
           const tracks = player.getVariantTracks()
           const active = tracks.find(t => t.active)
           if (active) {
-            console.log(`🔄 ABR mudou para: ${active.height}p (bandwidth: ${(active.bandwidth/1000000).toFixed(2)} Mbps)`)
+            console.log(`🔄 ABR mudou para: ${active.height}p (bandwidth: ${(active.bandwidth / 1000000).toFixed(2)} Mbps)`)
             setCurrentQuality(`${active.height}p`)
             onQualityChange?.(active)
           }
@@ -153,10 +156,10 @@ const ShakaVideoPlayer = forwardRef(({
           const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
           setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
           console.log('📊 Qualidades disponíveis:', uniqueHeights.map(h => `${h}p`).join(', '))
-          
+
           // Atualizar faixas de áudio
           updateAudioTracks(player)
-          
+
           // Atualizar legendas
           updateTextTracks(player)
         })
@@ -164,30 +167,30 @@ const ShakaVideoPlayer = forwardRef(({
         // Carregar mídia
         await player.load(src)
         console.log('🎬 Shaka Player carregado com sucesso')
-        
+
         // Configurar qualidades
         const tracks = player.getVariantTracks()
         const uniqueHeights = [...new Set(tracks.map(t => t.height))].sort((a, b) => b - a)
         setQualities(['auto', ...uniqueHeights.map(h => `${h}p`)])
-        
+
         // Log detalhado das tracks
         console.log('📺 Variant tracks encontradas:', tracks.length)
         tracks.forEach(t => {
           console.log(`  - ${t.height}p: bandwidth=${t.bandwidth}, active=${t.active}`)
         })
-        
+
         // Se houver qualidades altas disponíveis, tentar selecionar a melhor
         if (tracks.length > 1) {
           const highestTrack = tracks.reduce((a, b) => (a.height > b.height ? a : b))
           console.log(`🎯 Maior qualidade disponível: ${highestTrack.height}p`)
         }
-        
+
         // Configurar faixas de áudio
         updateAudioTracks(player)
-        
+
         // Configurar legendas
         updateTextTracks(player)
-        
+
         // Tentar autoplay após um pequeno delay
         if (autoPlay && videoRef.current) {
           setTimeout(async () => {
@@ -198,7 +201,7 @@ const ShakaVideoPlayer = forwardRef(({
             }
           }, 200)
         }
-        
+
         onReady?.()
       } catch (e) {
         console.error('Erro ao carregar mídia:', e)
@@ -235,14 +238,14 @@ const ShakaVideoPlayer = forwardRef(({
 
     const handleTimeUpdate = () => {
       setCurrentTime(video.currentTime)
-      
+
       // Atualizar duração se disponível (útil para streams que carregam a duração depois)
       if (video.duration && isFinite(video.duration) && video.duration > 0) {
         setDuration(video.duration)
       }
-      
+
       onTimeUpdate?.(video.currentTime, video.duration)
-      
+
       // Calcular buffer
       if (video.buffered.length > 0 && video.duration && isFinite(video.duration)) {
         const buffered = video.buffered.end(video.buffered.length - 1)
@@ -256,7 +259,7 @@ const ShakaVideoPlayer = forwardRef(({
         console.log('⏱️ Duração do vídeo:', formatTime(video.duration))
       }
     }
-    
+
     const handleLoadedMetadata = () => {
       if (video.duration && isFinite(video.duration) && video.duration > 0) {
         setDuration(video.duration)
@@ -366,7 +369,7 @@ const ShakaVideoPlayer = forwardRef(({
   const toggleFullscreen = useCallback(() => {
     const container = containerRef.current
     if (!container) return
-    
+
     if (document.fullscreenElement) {
       document.exitFullscreen()
     } else {
@@ -393,7 +396,7 @@ const ShakaVideoPlayer = forwardRef(({
       player.configure({ abr: { enabled: false } })
       const tracks = player.getVariantTracks()
       console.log(`📊 Tracks disponíveis:`, tracks.map(t => `${t.height}p`).join(', '))
-      
+
       const track = tracks.find(t => t.height === height)
       if (track) {
         player.selectVariantTrack(track, true)
@@ -401,7 +404,7 @@ const ShakaVideoPlayer = forwardRef(({
       } else {
         console.warn(`⚠️ Track ${height}p não encontrada. Disponíveis:`, tracks.map(t => t.height))
         // Tentar encontrar a qualidade mais próxima
-        const closest = tracks.reduce((prev, curr) => 
+        const closest = tracks.reduce((prev, curr) =>
           Math.abs(curr.height - height) < Math.abs(prev.height - height) ? curr : prev
         )
         if (closest) {
@@ -424,26 +427,36 @@ const ShakaVideoPlayer = forwardRef(({
   // Atualizar faixas de áudio
   const updateAudioTracks = useCallback((player) => {
     const variants = player.getVariantTracks()
-    const audioLanguages = new Map()
-    
+    const uniqueTracks = new Map()
+
     variants.forEach(variant => {
-      if (variant.audioId && !audioLanguages.has(variant.language)) {
-        audioLanguages.set(variant.language, {
+      // Ignorar variantes de vídeo (focar apenas nas propriedades de áudio)
+      // Criar ID único baseado nas características do áudio
+      const audioKey = `${variant.language}-${variant.audioRoles?.join('')}-${variant.channelsCount}-${variant.label}`
+
+      if (variant.audioId && !uniqueTracks.has(audioKey)) {
+        uniqueTracks.set(audioKey, {
+          id: audioKey, // Usar chave composta como ID interno
           language: variant.language || 'und',
-          label: getLanguageLabel(variant.language) || 'Desconhecido',
+          label: variant.label || getLanguageLabel(variant.language) || 'Desconhecido',
           roles: variant.audioRoles || [],
-          channelCount: variant.channelsCount || 2,
-          active: variant.active
+          channelCount: variant.channelsCount,
+          active: variant.active,
+          originalTrack: variant // Manter referência se necessário
         })
+      } else if (variant.active && uniqueTracks.has(audioKey)) {
+        // Se encontrarmos a variante ativa, atualizar o status
+        const track = uniqueTracks.get(audioKey)
+        track.active = true
       }
     })
-    
-    const tracks = Array.from(audioLanguages.values())
+
+    const tracks = Array.from(uniqueTracks.values())
     setAudioTracks(tracks)
-    
+
     const active = tracks.find(t => t.active)
     if (active) {
-      setCurrentAudioTrack(active.language)
+      setCurrentAudioTrack(active.id) // Usar ID único em vez de apenas idioma
     }
   }, [])
 
@@ -457,29 +470,39 @@ const ShakaVideoPlayer = forwardRef(({
       kind: track.kind || 'subtitles',
       active: track.active
     }))
-    
+
     setTextTracks([{ id: 'off', language: 'off', label: 'Desligado' }, ...formattedTracks])
-    
+
     const active = formattedTracks.find(t => t.active)
     setCurrentTextTrack(active ? active.language : 'off')
   }, [])
 
   // Mudar faixa de áudio
-  const changeAudioTrack = useCallback((language) => {
+  const changeAudioTrack = useCallback((trackId) => {
     const player = playerRef.current
     if (!player) return
-    
-    player.selectAudioLanguage(language)
-    setCurrentAudioTrack(language)
+
+    const track = audioTracks.find(t => t.id === trackId)
+    if (!track) return
+
+    // Configurar preferências para garantir a seleção correta
+    player.configure({
+      preferredAudioLanguage: track.language,
+      preferredAudioChannelCount: track.channelCount,
+      preferredAudioRole: track.roles?.[0] || ''
+    })
+
+    player.selectAudioLanguage(track.language, track.roles?.[0])
+    setCurrentAudioTrack(trackId)
     setShowSettings(false)
-    console.log(`🔊 Áudio alterado para: ${getLanguageLabel(language)}`)
-  }, [])
+    console.log(`🔊 Áudio alterado para: ${track.label} (${track.language}, ${track.channelCount}ch)`)
+  }, [audioTracks])
 
   // Mudar legenda
   const changeTextTrack = useCallback((language) => {
     const player = playerRef.current
     if (!player) return
-    
+
     if (language === 'off') {
       player.setTextTrackVisibility(false)
       setCurrentTextTrack('off')
@@ -580,7 +603,7 @@ const ShakaVideoPlayer = forwardRef(({
   }, [togglePlay, toggleFullscreen, toggleMute])
 
   return (
-    <div 
+    <div
       ref={containerRef}
       className={`shaka-player-container relative bg-black rounded-xl overflow-hidden shadow-2xl group ${isFullscreen ? 'fullscreen' : ''}`}
       style={{ aspectRatio: '16/9' }}
@@ -593,7 +616,7 @@ const ShakaVideoPlayer = forwardRef(({
         muted={muted}
         onClick={togglePlay}
       />
-      
+
       {/* Loading spinner */}
       {isBuffering && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/30 z-20 pointer-events-none">
@@ -601,25 +624,24 @@ const ShakaVideoPlayer = forwardRef(({
             <div className="w-16 h-16 border-4 border-red-600 border-t-transparent rounded-full animate-spin"></div>
             <div className="absolute inset-0 flex items-center justify-center">
               <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M8 5v14l11-7z"/>
+                <path d="M8 5v14l11-7z" />
               </svg>
             </div>
           </div>
         </div>
       )}
-      
+
       {/* Overlay de controles customizados */}
-      <div 
-        className={`absolute inset-0 transition-opacity duration-300 ${
-          showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
-        }`}
+      <div
+        className={`absolute inset-0 transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0 pointer-events-none'
+          }`}
       >
         {/* Gradiente superior */}
         <div className="absolute top-0 left-0 right-0 h-24 bg-gradient-to-b from-black/70 to-transparent" />
-        
+
         {/* Gradiente inferior */}
         <div className="absolute bottom-0 left-0 right-0 h-32 bg-gradient-to-t from-black/70 to-transparent" />
-        
+
         {/* Botão central de play/pause */}
         <div className="absolute inset-0 flex items-center justify-center">
           <button
@@ -628,7 +650,7 @@ const ShakaVideoPlayer = forwardRef(({
               transition-all duration-200 hover:bg-red-600 hover:scale-110 ${isPlaying ? 'opacity-0' : 'opacity-100'}`}
           >
             <svg className="w-10 h-10 text-white ml-1" fill="currentColor" viewBox="0 0 24 24">
-              <path d="M8 5v14l11-7z"/>
+              <path d="M8 5v14l11-7z" />
             </svg>
           </button>
         </div>
@@ -636,22 +658,22 @@ const ShakaVideoPlayer = forwardRef(({
         {/* Barra de controles inferior */}
         <div className="absolute bottom-0 left-0 right-0 p-4">
           {/* Barra de progresso */}
-          <div 
+          <div
             className="relative h-1 bg-white/30 rounded-full mb-4 cursor-pointer group/progress hover:h-1.5 transition-all"
             onClick={handleSeek}
           >
             {/* Buffer */}
-            <div 
+            <div
               className="absolute h-full bg-white/50 rounded-full"
               style={{ width: `${bufferedPercent}%` }}
             />
             {/* Progresso */}
-            <div 
+            <div
               className="absolute h-full bg-red-600 rounded-full"
               style={{ width: `${duration ? (currentTime / duration) * 100 : 0}%` }}
             />
             {/* Ponto indicador */}
-            <div 
+            <div
               className="absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-red-600 rounded-full 
                 opacity-0 group-hover/progress:opacity-100 transition-opacity shadow-lg"
               style={{ left: `calc(${duration ? (currentTime / duration) * 100 : 0}% - 8px)` }}
@@ -664,34 +686,34 @@ const ShakaVideoPlayer = forwardRef(({
             <button onClick={togglePlay} className="text-white hover:text-red-500 transition-colors p-1">
               {isPlaying ? (
                 <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
+                  <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
                 </svg>
               ) : (
                 <svg className="w-7 h-7" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M8 5v14l11-7z"/>
+                  <path d="M8 5v14l11-7z" />
                 </svg>
               )}
             </button>
 
             {/* Skip -10s */}
-            <button 
+            <button
               onClick={() => videoRef.current && (videoRef.current.currentTime -= 10)}
               className="text-white hover:text-red-500 transition-colors p-1"
               title="Voltar 10s"
             >
               <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/>
+                <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" />
               </svg>
             </button>
 
             {/* Skip +10s */}
-            <button 
+            <button
               onClick={() => videoRef.current && (videoRef.current.currentTime += 10)}
               className="text-white hover:text-red-500 transition-colors p-1"
               title="Avançar 10s"
             >
               <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/>
+                <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
               </svg>
             </button>
 
@@ -700,15 +722,15 @@ const ShakaVideoPlayer = forwardRef(({
               <button onClick={toggleMute} className="text-white hover:text-red-500 transition-colors p-1">
                 {isMuted || volume === 0 ? (
                   <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/>
+                    <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" />
                   </svg>
                 ) : volume < 0.5 ? (
                   <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z"/>
+                    <path d="M18.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM5 9v6h4l5 5V4L9 9H5z" />
                   </svg>
                 ) : (
                   <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/>
+                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
                   </svg>
                 )}
               </button>
@@ -735,19 +757,19 @@ const ShakaVideoPlayer = forwardRef(({
             {/* Badges de status */}
             <div className="flex items-center gap-2">
               {/* Badge Áudio */}
-              {currentAudioTrack && currentAudioTrack !== 'und' && (
+              {currentAudioTrack && (
                 <span className="bg-blue-600 text-white text-xs font-bold px-2 py-0.5 rounded uppercase">
-                  🔊 {currentAudioTrack}
+                  🔊 {audioTracks.find(t => t.id === currentAudioTrack)?.language || 'UND'}
                 </span>
               )}
-              
+
               {/* Badge Legenda */}
               {currentTextTrack && currentTextTrack !== 'off' && (
                 <span className="bg-green-600 text-white text-xs font-bold px-2 py-0.5 rounded uppercase">
                   📝 {currentTextTrack}
                 </span>
               )}
-              
+
               {/* Qualidade Badge */}
               {currentQuality !== 'auto' && (
                 <span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">
@@ -758,15 +780,15 @@ const ShakaVideoPlayer = forwardRef(({
 
             {/* Configurações */}
             <div className="relative">
-              <button 
+              <button
                 onClick={() => setShowSettings(s => !s)}
                 className="text-white hover:text-red-500 transition-colors p-1 flex items-center gap-1"
               >
                 <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22l-1.92 3.32c-.12.21-.07.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .31.02.63.06.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+                  <path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22l-1.92 3.32c-.12.21-.07.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94 0 .31.02.63.06.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.03-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
                 </svg>
               </button>
-              
+
               {/* Menu de configurações */}
               {showSettings && (
                 <div className="absolute bottom-full right-0 mb-2 bg-gray-900/95 backdrop-blur-sm rounded-lg shadow-xl overflow-hidden min-w-[220px] border border-gray-700">
@@ -774,33 +796,29 @@ const ShakaVideoPlayer = forwardRef(({
                   <div className="flex border-b border-gray-700">
                     <button
                       onClick={() => setSettingsTab('quality')}
-                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
-                        settingsTab === 'quality' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
-                      }`}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${settingsTab === 'quality' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                        }`}
                     >
                       📺 Qualidade
                     </button>
                     <button
                       onClick={() => setSettingsTab('audio')}
-                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
-                        settingsTab === 'audio' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
-                      }`}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${settingsTab === 'audio' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                        }`}
                     >
                       🔊 Áudio
                     </button>
                     <button
                       onClick={() => setSettingsTab('subtitles')}
-                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
-                        settingsTab === 'subtitles' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
-                      }`}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${settingsTab === 'subtitles' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                        }`}
                     >
                       📝 Legendas
                     </button>
                     <button
                       onClick={() => setSettingsTab('speed')}
-                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${
-                        settingsTab === 'speed' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
-                      }`}
+                      className={`flex-1 px-3 py-2 text-xs font-semibold transition-colors ${settingsTab === 'speed' ? 'text-red-500 bg-white/5' : 'text-gray-400 hover:text-white'
+                        }`}
                     >
                       ⚡ Veloc.
                     </button>
@@ -813,14 +831,13 @@ const ShakaVideoPlayer = forwardRef(({
                         <button
                           key={q}
                           onClick={() => changeQuality(q)}
-                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                            currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
-                          }`}
+                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
+                            }`}
                         >
                           <span>{q === 'auto' ? '🔄 Auto' : q}</span>
                           {currentQuality === q && (
                             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                             </svg>
                           )}
                         </button>
@@ -838,23 +855,25 @@ const ShakaVideoPlayer = forwardRef(({
                       ) : (
                         audioTracks.map((track) => (
                           <button
-                            key={track.language}
-                            onClick={() => changeAudioTrack(track.language)}
-                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                              currentAudioTrack === track.language ? 'text-red-500 bg-white/5' : 'text-white'
-                            }`}
+                            key={track.id}
+                            onClick={() => changeAudioTrack(track.id)}
+                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${currentAudioTrack === track.id ? 'text-red-500 bg-white/5' : 'text-white'
+                              }`}
                           >
                             <div className="flex flex-col">
                               <span>{track.label}</span>
-                              {track.channelCount && (
-                                <span className="text-xs text-gray-400">
-                                  {track.channelCount >= 6 ? '5.1 Surround' : 'Stereo'}
-                                </span>
-                              )}
+                              <div className="flex gap-2 text-xs text-gray-400">
+                                <span>{track.language.toUpperCase()}</span>
+                                {track.channelCount && (
+                                  <span>
+                                    • {track.channelCount >= 6 ? '5.1' : 'Stereo'}
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                            {currentAudioTrack === track.language && (
+                            {currentAudioTrack === track.id && (
                               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                               </svg>
                             )}
                           </button>
@@ -875,14 +894,13 @@ const ShakaVideoPlayer = forwardRef(({
                           <button
                             key={track.id || track.language}
                             onClick={() => changeTextTrack(track.language)}
-                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                              currentTextTrack === track.language ? 'text-red-500 bg-white/5' : 'text-white'
-                            }`}
+                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${currentTextTrack === track.language ? 'text-red-500 bg-white/5' : 'text-white'
+                              }`}
                           >
                             <span>{track.label}</span>
                             {currentTextTrack === track.language && (
                               <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                               </svg>
                             )}
                           </button>
@@ -898,14 +916,13 @@ const ShakaVideoPlayer = forwardRef(({
                         <button
                           key={rate}
                           onClick={() => changePlaybackRate(rate)}
-                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${
-                            playbackRate === rate ? 'text-red-500 bg-white/5' : 'text-white'
-                          }`}
+                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${playbackRate === rate ? 'text-red-500 bg-white/5' : 'text-white'
+                            }`}
                         >
                           <span>{rate === 1 ? 'Normal' : `${rate}x`}</span>
                           {playbackRate === rate && (
                             <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/>
+                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                             </svg>
                           )}
                         </button>
@@ -920,11 +937,11 @@ const ShakaVideoPlayer = forwardRef(({
             <button onClick={toggleFullscreen} className="text-white hover:text-red-500 transition-colors p-1">
               {isFullscreen ? (
                 <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>
+                  <path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" />
                 </svg>
               ) : (
                 <svg className="w-6 h-6" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/>
+                  <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" />
                 </svg>
               )}
             </button>

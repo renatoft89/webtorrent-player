@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"webtorrent-player/torrent"
 
@@ -110,10 +111,32 @@ func GetQualityPlaylist(c *gin.Context) {
 	}
 
 	playlistPath := filepath.Join(stream.HLSPath, quality, "playlist.m3u8")
-	
-	if _, err := os.Stat(playlistPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Qualidade não encontrada"})
-		return
+
+	// IMPORTANTE: o master.m3u8 é gerado antes das playlists de cada qualidade.
+	// O Shaka tende a solicitar TODAS as playlists listadas no master durante o load.
+	// Se retornarmos 404 cedo demais, o load falha. Então, aguardamos o arquivo existir.
+	// (Nginx está com proxy_read_timeout=300s, então segurar a conexão aqui é ok.)
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		if _, err := os.Stat(playlistPath); err == nil {
+			break
+		}
+
+		if stream.Status == "error" {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Stream em erro"})
+			return
+		}
+
+		if time.Now().After(deadline) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Playlist da qualidade ainda não foi gerada"})
+			return
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 
 	c.Header("Content-Type", "application/vnd.apple.mpegurl")
@@ -134,9 +157,9 @@ func GetSegment(c *gin.Context) {
 
 	// Verificar se é um segmento de qualidade específica (ex: 720p/segment001.ts)
 	segmentPath := filepath.Join(stream.HLSPath, segment)
-	
-	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Segmento não encontrado"})
+
+	// Evitar servir segmento enquanto ainda está sendo escrito (arquivo parcial)
+	if !waitForStableFile(c, segmentPath, 30*time.Second, 200*time.Millisecond) {
 		return
 	}
 
@@ -158,15 +181,74 @@ func GetQualitySegment(c *gin.Context) {
 	}
 
 	segmentPath := filepath.Join(stream.HLSPath, quality, segment)
-	
-	if _, err := os.Stat(segmentPath); os.IsNotExist(err) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Segmento não encontrado"})
+
+	// Evitar servir segmento enquanto ainda está sendo escrito (arquivo parcial)
+	if !waitForStableFile(c, segmentPath, 30*time.Second, 200*time.Millisecond) {
 		return
 	}
 
 	c.Header("Content-Type", "video/mp2t")
 	c.Header("Cache-Control", "max-age=3600")
 	c.File(segmentPath)
+}
+
+// waitForStableFile aguarda um arquivo existir e ficar com tamanho estável por um curto período.
+// Retorna false se já respondeu ao cliente (404/timeout/cancel).
+func waitForStableFile(c *gin.Context, path string, timeout time.Duration, stableWindow time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	var lastSize int64 = -1
+	var lastStableAt time.Time
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return false
+		default:
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if time.Now().After(deadline) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "Segmento não encontrado"})
+					return false
+				}
+				select {
+				case <-c.Request.Context().Done():
+					return false
+				case <-time.After(100 * time.Millisecond):
+				}
+				continue
+			}
+
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Erro ao acessar segmento"})
+			return false
+		}
+
+		size := info.Size()
+		if size == lastSize {
+			if lastStableAt.IsZero() {
+				lastStableAt = time.Now()
+			}
+			if time.Since(lastStableAt) >= stableWindow {
+				return true
+			}
+		} else {
+			lastSize = size
+			lastStableAt = time.Time{}
+		}
+
+		if time.Now().After(deadline) {
+			c.JSON(http.StatusGatewayTimeout, gin.H{"error": "Timeout aguardando segmento"})
+			return false
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // StopStream para e limpa um stream

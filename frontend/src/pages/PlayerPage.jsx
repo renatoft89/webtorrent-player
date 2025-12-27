@@ -22,6 +22,7 @@ function PlayerPage() {
   
   const playerRef = useRef(null)
   const autoStarted = useRef(false)
+  const autoRestart = useRef({ lastAt: 0, attempts: 0 })
 
   useEffect(() => {
     if (magnetFromUrl && !autoStarted.current) {
@@ -51,7 +52,38 @@ function PlayerPage() {
       if (cancelled) return
       try {
         const res = await fetch(`${API_URL}/stream/${streamId}/status`)
-        if (!res.ok && res.status === 404) return
+        if (res.status === 404) {
+          // Backend mantém streams apenas em memória. Se o backend reiniciar,
+          // um streamId antigo vira 404 e o player fica preso tentando carregar.
+          if (!cancelled) {
+            // Limpar estado atual
+            setStreamId(null)
+            setStatus(null)
+            setHlsUrl(null)
+            try { playerRef.current?.destroy() } catch (_) {}
+
+            // Auto-restart (1 tentativa por ~20s, até 3 vezes)
+            const magnetToRestart = (magnetFromUrl || input || '').trim()
+            const now = Date.now()
+            const canRetry = magnetToRestart && (now - autoRestart.current.lastAt > 20000) && (autoRestart.current.attempts < 3)
+
+            if (canRetry) {
+              autoRestart.current.lastAt = now
+              autoRestart.current.attempts += 1
+              setError(`Stream expirou/reiniciou. Reiniciando automaticamente (${autoRestart.current.attempts}/3)...`)
+              // Reiniciar em microtask para não conflitar com setState acima
+              setTimeout(() => startStream(magnetToRestart), 0)
+            } else {
+              setError('Stream expirou ou o backend reiniciou. Clique em Reproduzir para iniciar novamente.')
+            }
+          }
+          return
+        }
+        if (!res.ok) {
+          // Evitar parar o polling silenciosamente em erros transitórios.
+          setTimeout(pollStatus, 2000)
+          return
+        }
         const data = await res.json()
         if (cancelled) return
         setStatus(data)

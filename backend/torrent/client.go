@@ -43,6 +43,9 @@ var qualityLevels = []QualityLevel{
 	{Name: "480p", Width: 854, Height: 480, Bitrate: "1400k", MaxBitrate: "1498k", BufSize: "2100k", AudioRate: "128k", CRF: 26, Preset: "veryfast"},
 	{Name: "720p", Width: 1280, Height: 720, Bitrate: "2800k", MaxBitrate: "2996k", BufSize: "4200k", AudioRate: "128k", CRF: 24, Preset: "fast"},
 	{Name: "1080p", Width: 1920, Height: 1080, Bitrate: "5000k", MaxBitrate: "5350k", BufSize: "7500k", AudioRate: "192k", CRF: 22, Preset: "fast"},
+	// Qualidades mais altas (exigem bastante CPU/GPU, especialmente em tempo real)
+	{Name: "1440p", Width: 2560, Height: 1440, Bitrate: "9000k", MaxBitrate: "9630k", BufSize: "13500k", AudioRate: "192k", CRF: 21, Preset: "fast"},
+	{Name: "2160p", Width: 3840, Height: 2160, Bitrate: "16000k", MaxBitrate: "17120k", BufSize: "24000k", AudioRate: "256k", CRF: 20, Preset: "fast"},
 }
 
 type StreamInfo struct {
@@ -355,24 +358,29 @@ func downloadAndTranscode(stream *StreamInfo) {
 	
 	// Iniciar download completo do arquivo
 	videoFile.Download()
+
+	// OTIMIZAÇÃO: Priorização sequencial inteligente
+	go monitorAndPrioritizePieces(stream, videoFile)
 	
-	// Priorizar os primeiros 20MB para garantir que os headers estejam disponíveis
+	// Priorizar um bloco inicial maior para garantir que os headers E os primeiros segundos
+	// do arquivo estejam realmente disponíveis (evita o FFmpeg ler "buracos"/zeros e gerar
+	// segmentos corrompidos/sem áudio, que costumam causar Shaka Error 3018).
 	// Isso é crítico para o FFmpeg poder ler os metadados do arquivo
 	// Em arquivos MKV/MP4, os headers geralmente estão nos primeiros 5-10MB
 	pieceLength := t.Info().PieceLength
-	initialPieces := (20 * 1024 * 1024) / int(pieceLength) // Primeiros 20MB em peças
-	if initialPieces < 5 {
-		initialPieces = 5
+	initialPieces := (60 * 1024 * 1024) / int(pieceLength) // Primeiros ~60MB em peças
+	if initialPieces < 10 {
+		initialPieces = 10
 	}
-	if initialPieces > 30 {
-		initialPieces = 30 // Limitar para não priorizar demais
+	if initialPieces > 2000 {
+		initialPieces = 2000 // Limitar para não priorizar demais (pieceLength pode ser pequeno)
 	}
 	
 	// Obter o índice da primeira peça do arquivo de vídeo
 	fileOffset := videoFile.Offset()
 	firstPiece := int(fileOffset / int64(pieceLength))
 	
-	log.Printf("[%s] Priorizando primeiras %d peças (headers)...", stream.ID[:8], initialPieces)
+	log.Printf("[%s] Priorizando primeiras %d peças (bloco inicial/headers)...", stream.ID[:8], initialPieces)
 	
 	// Definir prioridade alta para as primeiras peças (headers do arquivo)
 	for i := 0; i < initialPieces; i++ {
@@ -421,10 +429,10 @@ func downloadAndTranscode(stream *StreamInfo) {
 				minPercent = 0.1 // 0.1%
 			}
 			
-			// Verificar se os headers estão prontos (primeiras peças baixadas)
+			// Verificar se o bloco inicial está pronto (primeiras peças baixadas e contíguas)
 			if !headersReady {
 				headersComplete := true
-				for i := 0; i < min(initialPieces, 5); i++ { // Verificar pelo menos as primeiras 5 peças
+				for i := 0; i < initialPieces; i++ {
 					pieceIndex := firstPiece + i
 					if pieceIndex < t.NumPieces() {
 						piece := t.Piece(pieceIndex)
@@ -437,7 +445,7 @@ func downloadAndTranscode(stream *StreamInfo) {
 				}
 				if headersComplete {
 					headersReady = true
-					log.Printf("[%s] ✅ Headers prontos! Primeiras peças baixadas.", stream.ID[:8])
+					log.Printf("[%s] ✅ Bloco inicial pronto! Primeiras %d peças completas.", stream.ID[:8], initialPieces)
 				}
 			}
 			
@@ -472,6 +480,70 @@ func downloadAndTranscode(stream *StreamInfo) {
 	}
 }
 
+func monitorAndPrioritizePieces(stream *StreamInfo, videoFile *torrent.File) {
+	t := stream.torrent
+	if t == nil { return }
+	
+	pieceLength := int64(t.Info().PieceLength)
+	fileOffset := videoFile.Offset()
+	fileLength := videoFile.Length()
+	
+	// Calculate first and last piece index for the file
+	firstPieceIndex := int(fileOffset / pieceLength)
+	lastPieceIndex := int((fileOffset + fileLength - 1) / pieceLength)
+	
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	
+	log.Printf("[%s] 🚀 Iniciando priorização sequencial de peças (Window: 30MB)", stream.ID[:8])
+	
+	for {
+		select {
+		case <-stream.cancelChan:
+			return
+		case <-ticker.C:
+			// Find first incomplete piece in the file range
+			startPriorityIndex := -1
+			
+			// Start scanning from the approximate current position to avoid scanning entire file
+			// But since pieces can be downloaded out of order, scanning from start of file is safer/more robust
+			// Optimization: keep track of last clean index?
+			// For now, linear scan of bitfield is fast enough for video files.
+			
+			for i := firstPieceIndex; i <= lastPieceIndex; i++ {
+				if i >= t.NumPieces() { break }
+				if !t.Piece(i).State().Complete {
+					startPriorityIndex = i
+					break
+				}
+			}
+			
+			if startPriorityIndex == -1 {
+				// All pieces complete
+				return
+			}
+			
+			// Prioritize next ~30MB (approx 15 seconds of 1080p)
+			windowBytes := int64(30 * 1024 * 1024)
+			piecesToPrioritize := int(windowBytes / pieceLength)
+			if piecesToPrioritize < 5 { piecesToPrioritize = 5 } // Minimum 5 pieces
+			
+			endPriorityIndex := startPriorityIndex + piecesToPrioritize
+			if endPriorityIndex > lastPieceIndex {
+				endPriorityIndex = lastPieceIndex
+			}
+			
+			// Apply priority
+			// Note: We don't clear priority of passed pieces because usually we want them to finish if they started.
+			for i := startPriorityIndex; i <= endPriorityIndex; i++ {
+				if i < t.NumPieces() {
+					t.Piece(i).SetPriority(torrent.PiecePriorityNow)
+				}
+			}
+		}
+	}
+}
+
 func transcodeToHLS(stream *StreamInfo) {
 	hlsDir := filepath.Join("./downloads", stream.ID, "hls")
 	if err := os.MkdirAll(hlsDir, 0755); err != nil {
@@ -497,7 +569,6 @@ func transcodeToHLS(stream *StreamInfo) {
 	log.Printf("[%s] Resolução fonte: %dx%d", stream.ID[:8], sourceWidth, sourceHeight)
 
 	// Determinar quais qualidades gerar baseado na resolução fonte
-	// Não faz sentido gerar 1080p se o vídeo fonte é 720p
 	availableQualities := []QualityLevel{}
 	for _, q := range qualityLevels {
 		if q.Height <= sourceHeight {
@@ -505,7 +576,6 @@ func transcodeToHLS(stream *StreamInfo) {
 		}
 	}
 	
-	// Se nenhuma qualidade se encaixa, usar a menor
 	if len(availableQualities) == 0 {
 		availableQualities = []QualityLevel{qualityLevels[0]}
 	}
@@ -519,14 +589,21 @@ func transcodeToHLS(stream *StreamInfo) {
 			return names
 		}())
 
-	// OTIMIZAÇÃO: Iniciar TODAS as transcodificações em paralelo
-	// Aguardar pelo menos 2 qualidades antes de marcar como "ready"
-	// Isso garante que o player terá opções de qualidade desde o início
-	
+	// OTIMIZAÇÃO CRÍTICA: Gerar Master Playlist IMEDIATAMENTE.
+	// Assumimos que todas as qualidades serão geradas.
+	// Isso permite que o player saiba o que esperar e tente carregar assim que possível.
+	if err := generateMasterPlaylist(stream, availableQualities); err != nil {
+		log.Printf("[%s] Erro ao gerar master playlist: %v", stream.ID[:8], err)
+	}
+
+	// Canais para monitorar início
 	qualitiesReady := make(chan string, len(availableQualities))
 	errors := make(chan error, len(availableQualities))
 	
-	// Iniciar TODAS as qualidades em paralelo
+	// A qualidade mais baixa (primeira da lista) é a crítica para desbloquear o player
+	lowestQualityName := availableQualities[0].Name
+
+	// Iniciar transcodificação de TODAS as qualidades em background
 	for _, q := range availableQualities {
 		go func(quality QualityLevel) {
 			err := transcodeQuality(stream, quality)
@@ -538,43 +615,47 @@ func transcodeToHLS(stream *StreamInfo) {
 		}(q)
 	}
 
-	// Aguardar TODAS as qualidades ficarem prontas
+	// Aguardar APENAS a qualidade mais baixa ter segmentos prontos para marcar "Ready"
+	// As outras qualidades continuarão sendo geradas em background.
+	log.Printf("[%s] ⏳ Aguardando segmento da qualidade base (%s) para liberar stream...", stream.ID[:8], lowestQualityName)
+	
+	streamReady := false
+	
 	go func() {
-		readyQualities := []string{}
+		// Monitorar progresso geral e erros
+		readyCount := 0
 		totalQualities := len(availableQualities)
-		errorCount := 0
 		
-		for len(readyQualities) + errorCount < totalQualities {
+		for readyCount < totalQualities {
 			select {
-			case q := <-qualitiesReady:
-				readyQualities = append(readyQualities, q)
-				stream.Qualities = readyQualities
-				log.Printf("[%s] ⏳ Qualidade %s pronta (%d/%d)", 
-					stream.ID[:8], q, len(readyQualities), totalQualities)
+			case qName := <-qualitiesReady:
+				readyCount++
+				
+				// Se a qualidade pronta for a mais baixa (ou se for a primeira a ficar pronta), liberar o player!
+				if !streamReady && (qName == lowestQualityName || readyCount == 1) {
+					streamReady = true
+					stream.Status = "ready"
+					stream.Qualities = []string{qName} // Inicialmente só sabemos dessa
+					stream.HLSPath = hlsDir // Garantir caminho
+					
+					log.Printf("[%s] 🎬 STREAM PRONTO! Qualidade %s iniciou. Liberando player.", stream.ID[:8], qName)
+					
+					// Salvar metadados no cache
+					duration, videoCodec, audioCodec, audioTracks, subtitleTracks := GetVideoInfo(stream.VideoFile)
+					GetMetadataCache().UpdateFromStream(stream, duration, videoCodec, audioCodec, audioTracks, subtitleTracks)
+				} else {
+					log.Printf("[%s] Qualidade adicional pronta: %s", stream.ID[:8], qName)
+				}
 				
 			case err := <-errors:
-				errorCount++
-				log.Printf("[%s] ⚠️ Erro em qualidade: %v", stream.ID[:8], err)
+				log.Printf("[%s] ⚠️ Erro em transcodificação: %v", stream.ID[:8], err)
+				readyCount++ // Contar como "finalizado" (com erro) para não bloquear loop se fosse o caso
 				
 			case <-stream.cancelChan:
 				return
 			}
 		}
-		
-		// Todas as qualidades prontas - gerar master playlist final
-		if len(readyQualities) > 0 {
-			if err := generateMasterPlaylist(stream, availableQualities); err != nil {
-				log.Printf("[%s] Erro ao gerar master playlist: %v", stream.ID[:8], err)
-			} else {
-				stream.Status = "ready"
-				log.Printf("[%s] 🎬 Stream ABR pronto com TODAS %d qualidades: %v", 
-					stream.ID[:8], len(readyQualities), readyQualities)
-				
-				// Salvar metadados no cache
-				duration, videoCodec, audioCodec, audioTracks, subtitleTracks := GetVideoInfo(stream.VideoFile)
-				GetMetadataCache().UpdateFromStream(stream, duration, videoCodec, audioCodec, audioTracks, subtitleTracks)
-			}
-		}
+		log.Printf("[%s] Todas as transcodificações foram iniciadas/finalizadas.", stream.ID[:8])
 	}()
 }
 
@@ -740,7 +821,9 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 	args = append(args,
 		"-hls_time", "2",
 		"-hls_list_size", "0",
-		"-hls_flags", "independent_segments+append_list",
+		// temp_file faz o muxer escrever segmentos/playlist em arquivo temporário e renomear ao final.
+		// Isso evita que o player leia segmentos .ts parcialmente gravados (causando erro 3018 no Shaka).
+		"-hls_flags", "independent_segments+append_list+temp_file",
 		"-hls_segment_type", "mpegts",
 		"-hls_segment_filename", segmentPath,
 		"-f", "hls",
@@ -754,39 +837,9 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error {
 	masterPath := filepath.Join(stream.HLSPath, "master.m3u8")
 
-	type PlaylistQuality struct {
-		Name      string
-		Width     int
-		Height    int
-		Bandwidth int
-	}
-
-	// Verificar quais qualidades realmente têm playlist
-	var availableQualities []PlaylistQuality
-	for _, q := range qualities {
-		playlistPath := filepath.Join(stream.HLSPath, q.Name, "playlist.m3u8")
-		if _, err := os.Stat(playlistPath); err == nil {
-			// Converter bitrate string para int (ex: "2800k" -> 2800000)
-			bitrateStr := strings.TrimSuffix(q.Bitrate, "k")
-			var bitrate int
-			fmt.Sscanf(bitrateStr, "%d", &bitrate)
-			bitrate *= 1000
-			
-			availableQualities = append(availableQualities, PlaylistQuality{
-				Name:      q.Name,
-				Width:     q.Width,
-				Height:    q.Height,
-				Bandwidth: bitrate,
-			})
-			log.Printf("[%s] Qualidade %s adicionada ao master playlist (bandwidth: %d)", stream.ID[:8], q.Name, bitrate)
-		}
-	}
-
-	if len(availableQualities) == 0 {
-		return fmt.Errorf("nenhuma qualidade disponível")
-	}
-
-	// Gerar master playlist manualmente para controle preciso
+	// Gerar master playlist contendo todas as qualidades previstas
+	// Não verificamos existência dos arquivos porque eles serão gerados em breve
+	
 	f, err := os.Create(masterPath)
 	if err != nil {
 		return err
@@ -798,21 +851,20 @@ func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error 
 	f.WriteString("#EXT-X-VERSION:3\n")
 
 	// Escrever cada qualidade (ordenar por bandwidth crescente para o player)
-	for _, q := range availableQualities {
+	for _, q := range qualities {
+		// Converter bitrate string para int
+		bitrateStr := strings.TrimSuffix(q.Bitrate, "k")
+		var bitrate int
+		fmt.Sscanf(bitrateStr, "%d", &bitrate)
+		bitrate *= 1000
+		
 		f.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,NAME=\"%s\"\n", 
-			q.Bandwidth, q.Width, q.Height, q.Name))
+			bitrate, q.Width, q.Height, q.Name))
 		f.WriteString(fmt.Sprintf("%s/playlist.m3u8\n", q.Name))
 	}
 
-	log.Printf("[%s] 📋 Master playlist gerado com %d qualidades: %v", 
-		stream.ID[:8], len(availableQualities), 
-		func() []string {
-			names := make([]string, len(availableQualities))
-			for i, q := range availableQualities {
-				names[i] = q.Name
-			}
-			return names
-		}())
+	log.Printf("[%s] 📋 Master playlist gerado antecipadamente com %d qualidades", 
+		stream.ID[:8], len(qualities))
 
 	return nil
 }
