@@ -426,26 +426,82 @@ const ShakaVideoPlayer = forwardRef(({
 
   // Atualizar faixas de áudio
   const updateAudioTracks = useCallback((player) => {
+    // Método 1: Tentar usar getAudioLanguagesAndRoles() que é mais confiável para HLS
+    try {
+      const audioLanguages = player.getAudioLanguagesAndRoles()
+      if (audioLanguages && audioLanguages.length > 0) {
+        const tracks = audioLanguages.map((item, index) => ({
+          id: `${item.language}-${item.role || 'main'}-${index}`,
+          language: item.language || 'und',
+          label: getLanguageLabel(item.language) || 'Desconhecido',
+          roles: item.role ? [item.role] : [],
+          channelCount: null, // Não disponível neste método
+          active: false // Será atualizado abaixo
+        }))
+
+        // Detectar qual está ativa
+        const variants = player.getVariantTracks()
+        const activeVariant = variants.find(v => v.active)
+        if (activeVariant) {
+          const activeTrack = tracks.find(t => 
+            t.language === activeVariant.language || 
+            t.language === activeVariant.audioLanguage
+          )
+          if (activeTrack) {
+            activeTrack.active = true
+            activeTrack.channelCount = activeVariant.channelsCount
+          }
+        }
+
+        // Adicionar contagem de canais para cada track
+        tracks.forEach(track => {
+          if (!track.channelCount) {
+            const matchingVariant = variants.find(v => 
+              v.language === track.language || v.audioLanguage === track.language
+            )
+            if (matchingVariant) {
+              track.channelCount = matchingVariant.channelsCount
+            }
+          }
+        })
+
+        if (tracks.length > 0) {
+          setAudioTracks(tracks)
+          const active = tracks.find(t => t.active)
+          if (active) {
+            setCurrentAudioTrack(active.id)
+          } else if (tracks.length > 0) {
+            tracks[0].active = true
+            setCurrentAudioTrack(tracks[0].id)
+          }
+          console.log('🔊 Faixas de áudio detectadas (método AudioLanguagesAndRoles):', tracks.length)
+          return
+        }
+      }
+    } catch (e) {
+      console.log('getAudioLanguagesAndRoles não disponível, usando método alternativo')
+    }
+
+    // Método 2: Fallback - extrair de variant tracks
     const variants = player.getVariantTracks()
     const uniqueTracks = new Map()
 
     variants.forEach(variant => {
-      // Ignorar variantes de vídeo (focar apenas nas propriedades de áudio)
       // Criar ID único baseado nas características do áudio
-      const audioKey = `${variant.language}-${variant.audioRoles?.join('')}-${variant.channelsCount}-${variant.label}`
+      const lang = variant.language || variant.audioLanguage || 'und'
+      const audioKey = `${lang}-${variant.audioRoles?.join('')}-${variant.channelsCount}`
 
-      if (variant.audioId && !uniqueTracks.has(audioKey)) {
+      if (variant.audioId !== undefined && !uniqueTracks.has(audioKey)) {
         uniqueTracks.set(audioKey, {
-          id: audioKey, // Usar chave composta como ID interno
-          language: variant.language || 'und',
-          label: variant.label || getLanguageLabel(variant.language) || 'Desconhecido',
+          id: audioKey,
+          language: lang,
+          label: variant.label || getLanguageLabel(lang) || 'Desconhecido',
           roles: variant.audioRoles || [],
           channelCount: variant.channelsCount,
           active: variant.active,
-          originalTrack: variant // Manter referência se necessário
+          originalTrack: variant
         })
       } else if (variant.active && uniqueTracks.has(audioKey)) {
-        // Se encontrarmos a variante ativa, atualizar o status
         const track = uniqueTracks.get(audioKey)
         track.active = true
       }
@@ -456,8 +512,9 @@ const ShakaVideoPlayer = forwardRef(({
 
     const active = tracks.find(t => t.active)
     if (active) {
-      setCurrentAudioTrack(active.id) // Usar ID único em vez de apenas idioma
+      setCurrentAudioTrack(active.id)
     }
+    console.log('🔊 Faixas de áudio detectadas (método VariantTracks):', tracks.length)
   }, [])
 
   // Atualizar legendas
@@ -485,17 +542,50 @@ const ShakaVideoPlayer = forwardRef(({
     const track = audioTracks.find(t => t.id === trackId)
     if (!track) return
 
-    // Configurar preferências para garantir a seleção correta
-    player.configure({
-      preferredAudioLanguage: track.language,
-      preferredAudioChannelCount: track.channelCount,
-      preferredAudioRole: track.roles?.[0] || ''
-    })
+    try {
+      // Método 1: Tentar selectAudioLanguage (mais direto para HLS)
+      const role = track.roles?.[0] || ''
+      player.selectAudioLanguage(track.language, role)
+      
+      // Configurar preferências para futuras seleções automáticas
+      player.configure({
+        preferredAudioLanguage: track.language,
+        preferredAudioChannelCount: track.channelCount || 2,
+        preferredAudioRole: role
+      })
 
-    player.selectAudioLanguage(track.language, track.roles?.[0])
-    setCurrentAudioTrack(trackId)
-    setShowSettings(false)
-    console.log(`🔊 Áudio alterado para: ${track.label} (${track.language}, ${track.channelCount}ch)`)
+      // Atualizar estado local
+      setCurrentAudioTrack(trackId)
+      
+      // Atualizar o estado de todas as tracks
+      setAudioTracks(prev => prev.map(t => ({
+        ...t,
+        active: t.id === trackId
+      })))
+
+      setShowSettings(false)
+      console.log(`🔊 Áudio alterado para: ${track.label} (${track.language}${track.channelCount ? `, ${track.channelCount}ch` : ''})`)
+    } catch (e) {
+      console.error('Erro ao trocar faixa de áudio:', e)
+      
+      // Método 2: Fallback - tentar selecionar variant track diretamente
+      try {
+        const variants = player.getVariantTracks()
+        const targetVariant = variants.find(v => 
+          (v.language === track.language || v.audioLanguage === track.language) &&
+          (!track.roles?.length || v.audioRoles?.includes(track.roles[0]))
+        )
+        
+        if (targetVariant) {
+          player.selectVariantTrack(targetVariant, true)
+          setCurrentAudioTrack(trackId)
+          setShowSettings(false)
+          console.log(`🔊 Áudio alterado via variant track: ${track.label}`)
+        }
+      } catch (e2) {
+        console.error('Fallback de troca de áudio também falhou:', e2)
+      }
+    }
   }, [audioTracks])
 
   // Mudar legenda
@@ -757,7 +847,7 @@ const ShakaVideoPlayer = forwardRef(({
             {/* Badges de status */}
             <div className="flex items-center gap-2">
               {/* Badge Áudio */}
-              {currentAudioTrack && (
+              {currentAudioTrack && audioTracks.length > 1 && (
                 <span className="bg-blue-600 text-white text-xs font-bold px-2 py-0.5 rounded uppercase">
                   🔊 {audioTracks.find(t => t.id === currentAudioTrack)?.language || 'UND'}
                 </span>
@@ -770,12 +860,28 @@ const ShakaVideoPlayer = forwardRef(({
                 </span>
               )}
 
-              {/* Qualidade Badge */}
-              {currentQuality !== 'auto' && (
-                <span className="bg-red-600 text-white text-xs font-bold px-2 py-0.5 rounded">
-                  {currentQuality}
+              {/* Badge HD/FHD quando disponível */}
+              {qualities.some(q => q === '1080p' || q === '1440p' || q === '2160p') && (
+                <span className={`text-white text-xs font-bold px-2 py-0.5 rounded ${
+                  qualities.includes('2160p') ? 'bg-purple-600' :
+                  qualities.includes('1440p') ? 'bg-indigo-600' :
+                  'bg-blue-600'
+                }`}>
+                  {qualities.includes('2160p') ? '4K' :
+                   qualities.includes('1440p') ? '2K' :
+                   'FHD'}
                 </span>
               )}
+
+              {/* Qualidade Badge - mostra a qualidade atual */}
+              <span className={`text-white text-xs font-bold px-2 py-0.5 rounded cursor-pointer hover:opacity-80 ${
+                currentQuality === 'auto' ? 'bg-gray-600' :
+                parseInt(currentQuality) >= 1080 ? 'bg-red-600' :
+                parseInt(currentQuality) >= 720 ? 'bg-orange-600' :
+                'bg-gray-600'
+              }`} onClick={() => setShowSettings(s => !s)} title="Clique para mudar qualidade">
+                {currentQuality === 'auto' ? '🔄 Auto' : currentQuality}
+              </span>
             </div>
 
             {/* Configurações */}
@@ -827,21 +933,35 @@ const ShakaVideoPlayer = forwardRef(({
                   {/* Conteúdo da aba Qualidade */}
                   {settingsTab === 'quality' && (
                     <div className="max-h-48 overflow-y-auto">
-                      {qualities.map((q) => (
-                        <button
-                          key={q}
-                          onClick={() => changeQuality(q)}
-                          className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
-                            }`}
-                        >
-                          <span>{q === 'auto' ? '🔄 Auto' : q}</span>
-                          {currentQuality === q && (
-                            <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                              <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
-                            </svg>
-                          )}
-                        </button>
-                      ))}
+                      {qualities.map((q) => {
+                        const height = parseInt(q)
+                        const isHD = height >= 720 && height < 1080
+                        const isFHD = height >= 1080 && height < 1440
+                        const is2K = height >= 1440 && height < 2160
+                        const is4K = height >= 2160
+                        
+                        return (
+                          <button
+                            key={q}
+                            onClick={() => changeQuality(q)}
+                            className={`w-full px-4 py-2.5 text-left text-sm hover:bg-white/10 transition-colors flex items-center justify-between ${currentQuality === q ? 'text-red-500 bg-white/5' : 'text-white'
+                              }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <span>{q === 'auto' ? '🔄 Auto' : q}</span>
+                              {isFHD && <span className="text-xs bg-blue-600 px-1.5 py-0.5 rounded font-bold">FHD</span>}
+                              {is2K && <span className="text-xs bg-indigo-600 px-1.5 py-0.5 rounded font-bold">2K</span>}
+                              {is4K && <span className="text-xs bg-purple-600 px-1.5 py-0.5 rounded font-bold">4K</span>}
+                              {isHD && <span className="text-xs bg-gray-600 px-1.5 py-0.5 rounded font-bold">HD</span>}
+                            </div>
+                            {currentQuality === q && (
+                              <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
+                              </svg>
+                            )}
+                          </button>
+                        )
+                      })}
                     </div>
                   )}
 

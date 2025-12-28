@@ -49,20 +49,21 @@ var qualityLevels = []QualityLevel{
 }
 
 type StreamInfo struct {
-	ID             string          `json:"id"`
-	MagnetLink     string          `json:"magnetLink"`
-	Status         string          `json:"status"` // downloading, transcoding, ready, error
-	Progress       float64         `json:"progress"`
-	FileName       string          `json:"fileName"`
-	VideoFile      string          `json:"videoFile"`
-	HLSPath        string          `json:"hlsPath"`
-	Error          string          `json:"error,omitempty"`
-	Peers          int             `json:"peers"`
-	DownloadRate   float64         `json:"downloadRate"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	Qualities      []string        `json:"qualities"` // Qualidades disponíveis
-	SourceWidth    int             `json:"sourceWidth"`
-	SourceHeight   int             `json:"sourceHeight"`
+	ID             string            `json:"id"`
+	MagnetLink     string            `json:"magnetLink"`
+	Status         string            `json:"status"` // downloading, transcoding, ready, error
+	Progress       float64           `json:"progress"`
+	FileName       string            `json:"fileName"`
+	VideoFile      string            `json:"videoFile"`
+	HLSPath        string            `json:"hlsPath"`
+	Error          string            `json:"error,omitempty"`
+	Peers          int               `json:"peers"`
+	DownloadRate   float64           `json:"downloadRate"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	Qualities      []string          `json:"qualities"`    // Qualidades disponíveis
+	SourceWidth    int               `json:"sourceWidth"`
+	SourceHeight   int               `json:"sourceHeight"`
+	AudioTracks    []AudioTrackInfo  `json:"audioTracks"`  // Faixas de áudio disponíveis
 	torrent        *torrent.Torrent
 	cancelChan     chan struct{}
 	ffmpegProcs    []*exec.Cmd
@@ -568,6 +569,11 @@ func transcodeToHLS(stream *StreamInfo) {
 	stream.SourceHeight = sourceHeight
 	log.Printf("[%s] Resolução fonte: %dx%d", stream.ID[:8], sourceWidth, sourceHeight)
 
+	// Detectar faixas de áudio disponíveis
+	audioTracks := GetAudioTracksInfo(stream.VideoFile)
+	stream.AudioTracks = audioTracks
+	log.Printf("[%s] Faixas de áudio detectadas: %d", stream.ID[:8], len(audioTracks))
+
 	// Determinar quais qualidades gerar baseado na resolução fonte
 	availableQualities := []QualityLevel{}
 	for _, q := range qualityLevels {
@@ -672,8 +678,8 @@ func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
 	log.Printf("[%s] Iniciando transcodificação %s (%dx%d @ %s)...", 
 		stream.ID[:8], quality.Name, quality.Width, quality.Height, quality.Bitrate)
 
-	// Construir argumentos FFmpeg baseado no hardware disponível
-	args := buildFFmpegArgs(stream.VideoFile, quality, playlistPath, segmentPath)
+	// Construir argumentos FFmpeg baseado no hardware disponível e faixas de áudio
+	args := buildFFmpegArgs(stream.VideoFile, quality, playlistPath, segmentPath, stream.AudioTracks)
 
 	cmd := exec.Command("ffmpeg", args...)
 	
@@ -718,7 +724,7 @@ func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
 }
 
 // buildFFmpegArgs constrói os argumentos do FFmpeg baseado no hardware disponível
-func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segmentPath string) []string {
+func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segmentPath string, audioTracks []AudioTrackInfo) []string {
 	// Garantir que hwAccel foi detectado
 	hwAccelInit.Do(func() {
 		hwAccel = detectHardwareAcceleration()
@@ -748,6 +754,21 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 	}
 	
 	args = append(args, "-i", inputFile)
+
+	// Mapear o stream de vídeo
+	args = append(args, "-map", "0:v:0")
+
+	// Mapear TODAS as faixas de áudio
+	if len(audioTracks) > 1 {
+		// Se há múltiplas faixas, mapear cada uma explicitamente
+		for i := range audioTracks {
+			args = append(args, "-map", fmt.Sprintf("0:a:%d", i))
+		}
+		log.Printf("[FFmpeg] Mapeando %d faixas de áudio", len(audioTracks))
+	} else {
+		// Apenas uma faixa ou nenhuma detectada - mapear todas as faixas de áudio disponíveis
+		args = append(args, "-map", "0:a?")
+	}
 	
 	// Adicionar filtros e codecs baseado no hardware
 	switch hwAccel {
@@ -809,13 +830,21 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 		"-sc_threshold", "0",
 	)
 	
-	// Codec de áudio AAC
+	// Codec de áudio AAC para TODAS as faixas
 	args = append(args,
 		"-c:a", "aac",
 		"-b:a", quality.AudioRate,
 		"-ac", "2",
 		"-ar", "48000",
 	)
+
+	// Adicionar metadados de idioma para cada faixa de áudio
+	for i, track := range audioTracks {
+		args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), fmt.Sprintf("language=%s", track.Language))
+		if track.Title != "" {
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), fmt.Sprintf("title=%s", track.Title))
+		}
+	}
 	
 	// Configurações HLS
 	args = append(args,
@@ -833,7 +862,7 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 	return args
 }
 
-// generateMasterPlaylist gera o master playlist HLS com todas as qualidades
+// generateMasterPlaylist gera o master playlist HLS com todas as qualidades e faixas de áudio
 func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error {
 	masterPath := filepath.Join(stream.HLSPath, "master.m3u8")
 
@@ -848,7 +877,43 @@ func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error 
 
 	// Escrever header
 	f.WriteString("#EXTM3U\n")
-	f.WriteString("#EXT-X-VERSION:3\n")
+	f.WriteString("#EXT-X-VERSION:4\n") // Versão 4 para suportar EXT-X-MEDIA
+
+	// Se há múltiplas faixas de áudio, declará-las com EXT-X-MEDIA
+	audioGroup := ""
+	if len(stream.AudioTracks) > 1 {
+		audioGroup = "audio"
+		for i, track := range stream.AudioTracks {
+			isDefault := "NO"
+			if track.Default || i == 0 {
+				isDefault = "YES"
+			}
+			
+			// Nome amigável para a faixa
+			name := track.Title
+			if name == "" {
+				name = getLanguageName(track.Language)
+			}
+			
+			// Canais formatados
+			channels := ""
+			if track.Channels > 0 {
+				if track.Channels >= 6 {
+					channels = fmt.Sprintf(",CHANNELS=\"%d\"", track.Channels)
+				} else {
+					channels = fmt.Sprintf(",CHANNELS=\"%d\"", track.Channels)
+				}
+			}
+			
+			// EXT-X-MEDIA para áudio alternativo
+			// Note: Não usamos URI aqui porque o áudio está multiplexado nos segmentos .ts
+			// O Shaka Player identificará as faixas pelos metadados dos segmentos
+			f.WriteString(fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=%s,AUTOSELECT=%s%s\n",
+				audioGroup, name, track.Language, isDefault, isDefault, channels))
+		}
+		f.WriteString("\n")
+		log.Printf("[%s] 🔊 Master playlist incluiu %d faixas de áudio", stream.ID[:8], len(stream.AudioTracks))
+	}
 
 	// Escrever cada qualidade (ordenar por bandwidth crescente para o player)
 	for _, q := range qualities {
@@ -858,8 +923,14 @@ func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error 
 		fmt.Sscanf(bitrateStr, "%d", &bitrate)
 		bitrate *= 1000
 		
-		f.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,NAME=\"%s\"\n", 
-			bitrate, q.Width, q.Height, q.Name))
+		// Incluir referência ao grupo de áudio se houver múltiplas faixas
+		if audioGroup != "" {
+			f.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,NAME=\"%s\",AUDIO=\"%s\"\n", 
+				bitrate, q.Width, q.Height, q.Name, audioGroup))
+		} else {
+			f.WriteString(fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,NAME=\"%s\"\n", 
+				bitrate, q.Width, q.Height, q.Name))
+		}
 		f.WriteString(fmt.Sprintf("%s/playlist.m3u8\n", q.Name))
 	}
 

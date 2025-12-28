@@ -314,3 +314,116 @@ func GetVideoInfo(videoPath string) (duration float64, videoCodec, audioCodec st
 	
 	return
 }
+
+// AudioTrackInfo contém informações detalhadas de uma faixa de áudio
+type AudioTrackInfo struct {
+	Index       int    `json:"index"`       // Índice do stream no arquivo (0, 1, 2...)
+	StreamIndex int    `json:"streamIndex"` // Índice absoluto do stream
+	Language    string `json:"language"`    // Código do idioma (eng, por, jpn, etc)
+	Title       string `json:"title"`       // Nome/título da faixa
+	Codec       string `json:"codec"`       // Codec (aac, ac3, dts, etc)
+	Channels    int    `json:"channels"`    // Número de canais (2=stereo, 6=5.1)
+	Default     bool   `json:"default"`     // Se é a faixa padrão
+}
+
+// GetAudioTracksInfo obtém informações detalhadas de todas as faixas de áudio
+func GetAudioTracksInfo(videoPath string) []AudioTrackInfo {
+	cmd := exec.Command("ffprobe",
+		"-v", "error",
+		"-select_streams", "a",
+		"-show_entries", "stream=index,codec_name,channels:stream_tags=language,title",
+		"-of", "json",
+		videoPath,
+	)
+
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Erro ao obter faixas de áudio: %v", err)
+		return nil
+	}
+
+	// Parse JSON do ffprobe
+	var result struct {
+		Streams []struct {
+			Index     int    `json:"index"`
+			CodecName string `json:"codec_name"`
+			Channels  int    `json:"channels"`
+			Tags      struct {
+				Language string `json:"language"`
+				Title    string `json:"title"`
+			} `json:"tags"`
+		} `json:"streams"`
+	}
+
+	if err := json.Unmarshal(output, &result); err != nil {
+		log.Printf("Erro ao parsear JSON do ffprobe: %v", err)
+		return nil
+	}
+
+	tracks := make([]AudioTrackInfo, 0, len(result.Streams))
+	for i, stream := range result.Streams {
+		lang := stream.Tags.Language
+		if lang == "" {
+			lang = "und" // undefined
+		}
+
+		title := stream.Tags.Title
+		if title == "" {
+			// Gerar título baseado no idioma
+			title = getLanguageName(lang)
+		}
+
+		tracks = append(tracks, AudioTrackInfo{
+			Index:       i,
+			StreamIndex: stream.Index,
+			Language:    lang,
+			Title:       title,
+			Codec:       stream.CodecName,
+			Channels:    stream.Channels,
+			Default:     i == 0, // Primeira faixa é a padrão
+		})
+	}
+
+	log.Printf("🔊 Faixas de áudio encontradas: %d", len(tracks))
+	for _, t := range tracks {
+		log.Printf("   - [%d] %s (%s) - %s - %d canais", t.Index, t.Title, t.Language, t.Codec, t.Channels)
+	}
+
+	return tracks
+}
+
+// getLanguageName retorna o nome do idioma a partir do código ISO
+func getLanguageName(code string) string {
+	languages := map[string]string{
+		"por": "Português",
+		"pt":  "Português",
+		"eng": "English",
+		"en":  "English",
+		"spa": "Español",
+		"es":  "Español",
+		"jpn": "日本語",
+		"ja":  "日本語",
+		"ger": "Deutsch",
+		"de":  "Deutsch",
+		"fre": "Français",
+		"fr":  "Français",
+		"ita": "Italiano",
+		"it":  "Italiano",
+		"rus": "Русский",
+		"ru":  "Русский",
+		"kor": "한국어",
+		"ko":  "한국어",
+		"chi": "中文",
+		"zh":  "中文",
+		"ara": "العربية",
+		"ar":  "العربية",
+		"hin": "हिन्दी",
+		"hi":  "हिन्दी",
+		"und": "Unknown",
+	}
+
+	if name, ok := languages[code]; ok {
+		return name
+	}
+	return strings.ToUpper(code)
+}

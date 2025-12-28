@@ -67,6 +67,7 @@ func GetStreamStatus(c *gin.Context) {
 		"qualities":    stream.Qualities,
 		"sourceWidth":  stream.SourceWidth,
 		"sourceHeight": stream.SourceHeight,
+		"audioTracks":  stream.AudioTracks, // Faixas de áudio disponíveis
 		"hlsUrl":       "/api/stream/" + stream.ID + "/master.m3u8",
 	})
 }
