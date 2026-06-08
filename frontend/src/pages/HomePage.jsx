@@ -29,6 +29,8 @@ const ADDONS = {
 }
 
 const CINEMETA_API = 'https://v3-cinemeta.strem.io'
+const API_URL = '/api'
+const LOCALE = 'pt-BR'
 
 function HomePage() {
   const navigate = useNavigate()
@@ -43,18 +45,29 @@ function HomePage() {
   const [activeAddons, setActiveAddons] = useState(['brazuca', 'torrentio', 'piratebay'])
   const [loadingAddons, setLoadingAddons] = useState({})
   const [isLoadingTrending, setIsLoadingTrending] = useState(true)
+  const [tmdbActive, setTmdbActive] = useState(true)
 
   useEffect(() => { fetchTrending() }, [])
 
   const fetchTrending = async () => {
     setIsLoadingTrending(true)
     try {
-      const res = await fetch(`${CINEMETA_API}/catalog/movie/top.json`)
-      const data = await res.json()
+      let res = await fetch(`${API_URL}/tmdb/trending`)
+      let data = await res.json()
+      
+      if (res.status === 401 || data.error === 'TMDB_API_KEY_NOT_CONFIGURED') {
+        setTmdbActive(false)
+        console.warn('TMDB API Key não configurada. Usando fallback do Cinemeta (títulos em inglês).')
+        res = await fetch(`${CINEMETA_API}/catalog/movie/top.json?locale=${LOCALE}`, { headers: { 'Accept-Language': LOCALE } })
+        data = await res.json()
+      } else {
+        setTmdbActive(true)
+      }
+
       const movies = (data.metas || []).slice(0, 12).map(m => ({
-        id: m.id, imdb_id: m.id, title: m.name, poster_path: m.poster,
+        id: m.id, imdb_id: m.id.startsWith('tt') ? m.id : null, title: m.name, poster_path: m.poster,
         backdrop_path: m.background, vote_average: m.imdbRating ? parseFloat(m.imdbRating) : 0,
-        release_date: m.releaseInfo || m.year, overview: m.description, media_type: 'movie'
+        release_date: m.releaseInfo || m.year, overview: m.description, media_type: m.type || 'movie'
       }))
       setTrending(movies)
     } catch (err) { console.error('Erro:', err) }
@@ -66,32 +79,70 @@ function HomePage() {
     if (!search.trim()) return
     setLoading(true); setError(null); setResults([])
     try {
-      const [moviesRes, seriesRes] = await Promise.all([
-        fetch(`${CINEMETA_API}/catalog/movie/top/search=${encodeURIComponent(search)}.json`),
-        fetch(`${CINEMETA_API}/catalog/series/top/search=${encodeURIComponent(search)}.json`)
-      ])
-      const [moviesData, seriesData] = await Promise.all([moviesRes.json(), seriesRes.json()])
+      let moviesData, seriesData
+      
+      if (!tmdbActive) {
+        const [fallbackMoviesRes, fallbackSeriesRes] = await Promise.all([
+          fetch(`${CINEMETA_API}/catalog/movie/top/search=${encodeURIComponent(search)}.json?locale=${LOCALE}`, { headers: { 'Accept-Language': LOCALE } }),
+          fetch(`${CINEMETA_API}/catalog/series/top/search=${encodeURIComponent(search)}.json?locale=${LOCALE}`, { headers: { 'Accept-Language': LOCALE } })
+        ])
+        moviesData = await fallbackMoviesRes.json()
+        seriesData = await fallbackSeriesRes.json()
+      } else {
+        const moviesRes = await fetch(`${API_URL}/tmdb/search/movie?query=${encodeURIComponent(search)}`)
+        moviesData = await moviesRes.json()
+        
+        if (moviesRes.status === 401 || moviesData.error === 'TMDB_API_KEY_NOT_CONFIGURED') {
+          setTmdbActive(false)
+          const [fallbackMoviesRes, fallbackSeriesRes] = await Promise.all([
+            fetch(`${CINEMETA_API}/catalog/movie/top/search=${encodeURIComponent(search)}.json?locale=${LOCALE}`, { headers: { 'Accept-Language': LOCALE } }),
+            fetch(`${CINEMETA_API}/catalog/series/top/search=${encodeURIComponent(search)}.json?locale=${LOCALE}`, { headers: { 'Accept-Language': LOCALE } })
+          ])
+          moviesData = await fallbackMoviesRes.json()
+          seriesData = await fallbackSeriesRes.json()
+        } else {
+          const seriesRes = await fetch(`${API_URL}/tmdb/search/series?query=${encodeURIComponent(search)}`)
+          seriesData = await seriesRes.json()
+        }
+      }
+
       const movies = (moviesData.metas || []).map(m => ({
-        id: m.id, imdb_id: m.id, title: m.name, poster_path: m.poster, backdrop_path: m.background,
+        id: m.id, imdb_id: m.id.startsWith('tt') ? m.id : null, title: m.name, poster_path: m.poster, backdrop_path: m.background,
         vote_average: m.imdbRating ? parseFloat(m.imdbRating) : 0, release_date: m.releaseInfo || m.year,
-        overview: m.description, media_type: 'movie'
+        overview: m.description, media_type: m.type || 'movie'
       }))
       const series = (seriesData.metas || []).map(s => ({
-        id: s.id, imdb_id: s.id, title: s.name, poster_path: s.poster, backdrop_path: s.background,
+        id: s.id, imdb_id: s.id.startsWith('tt') ? s.id : null, title: s.name, poster_path: s.poster, backdrop_path: s.background,
         vote_average: s.imdbRating ? parseFloat(s.imdbRating) : 0, first_air_date: s.releaseInfo || s.year,
-        overview: s.description, media_type: 'tv'
+        overview: s.description, media_type: s.type || 'tv'
       }))
       const combined = [...movies, ...series].sort((a, b) => (b.vote_average || 0) - (a.vote_average || 0)).slice(0, 20)
       setResults(combined)
       if (combined.length === 0) setError('Nenhum resultado encontrado')
-    } catch { setError('Erro ao buscar') }
+    } catch (err) {
+      console.error(err)
+      setError('Erro ao buscar')
+    }
     finally { setLoading(false) }
   }
 
   const fetchStreams = async (item) => {
     setSelectedItem(item); setStreams([]); setLoadingStreams(item.id); setLoadingAddons({}); setError(null)
     try {
-      const imdbId = item.imdb_id || item.id
+      let imdbId = item.imdb_id
+      if (!imdbId || !imdbId.startsWith('tt')) {
+        try {
+          const extRes = await fetch(`${API_URL}/tmdb/external-ids?id=${item.id}&type=${item.media_type}`)
+          if (!extRes.ok) throw new Error('Não foi possível obter o ID do IMDb')
+          const extData = await extRes.json()
+          imdbId = extData.imdb_id
+        } catch (extErr) {
+          console.error(extErr)
+          setError('IMDb ID não encontrado no TMDB')
+          setLoadingStreams(null)
+          return
+        }
+      }
       if (!imdbId?.startsWith('tt')) { setError('IMDB ID não encontrado'); setLoadingStreams(null); return }
       const type = item.media_type === 'movie' ? 'movie' : 'series'
       const allStreams = []
@@ -218,6 +269,12 @@ function HomePage() {
       </header>
 
       <main className="relative max-w-7xl mx-auto px-4 sm:px-6 py-8">
+        {!tmdbActive && (
+          <div className="mb-6 p-4 glass rounded-xl border border-yellow-500/30 text-yellow-300 flex items-center gap-3 animate-slide-up text-xs sm:text-sm">
+            <span className="text-lg">⚠️</span>
+            <span>Exibindo títulos em inglês (Cinemeta). Configure a variável <code>TMDB_API_KEY</code> no backend para habilitar os títulos em português do Brasil.</span>
+          </div>
+        )}
         {error && !selectedItem && (
           <div className="mb-6 p-4 glass rounded-xl border border-red-500/30 text-red-300 flex items-center gap-3 animate-slide-up">
             <span className="text-xl">❌</span><span>{error}</span>

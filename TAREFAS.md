@@ -2,48 +2,45 @@
 
 ---
 
-## ✅ Tarefa 1: Corrigir Faixa de Áudio do Player - **CONCLUÍDA**
+## ✅ Tarefa 1: Corrigir Faixa de Áudio do Player - **CONCLUÍDA v2**
 
 ### Descrição do Problema
-A seleção de faixa de áudio no player não funciona corretamente. O usuário pode ver as opções de áudio no menu de configurações, mas a troca entre faixas de áudio pode não estar funcionando como esperado.
+A seleção de faixa de áudio no player não funcionava. O usuário podia ver as opções de áudio no menu de configurações, mas a troca entre faixas de áudio não tinha efeito.
 
-### ✅ Solução Implementada
+### 🔍 Causa Raiz Identificada
+O problema era que **todas as faixas de áudio estavam multiplexadas nos mesmos segmentos .ts**. O HLS com áudio multiplexado **não suporta troca dinâmica de áudio pelo player** - todas as faixas são tocadas juntas ou o player simplesmente não consegue alternar.
+
+### ✅ Solução Implementada (v2 - Streams de Áudio Separados)
+
+#### Arquitetura Corrigida:
+- **Áudio primário (track 0)**: Continua embutido nos segmentos de vídeo para compatibilidade
+- **Áudios alternativos (track 1+)**: Gerados em **streams HLS separados** com seus próprios playlists
 
 #### Backend - Modificações Realizadas:
 
-1. **Nova função `GetAudioTracksInfo`** em [cache.go](backend/torrent/cache.go):
-   - Usa `ffprobe` para obter informações detalhadas de TODAS as faixas de áudio
-   - Retorna: índice, idioma, título, codec, número de canais
-   - Detecta automaticamente o nome do idioma
+1. **Nova função `transcodeAudioTrack`** em [client.go](backend/torrent/client.go):
+   - Gera streams HLS de áudio separados para cada faixa alternativa
+   - Cria diretórios `audio_{idioma}/` com seus próprios segmentos
+   - Usa FFmpeg: `-map 0:a:N -vn -c:a aac` para extrair apenas áudio
 
-2. **Novo campo `AudioTracks` em `StreamInfo`** em [client.go](backend/torrent/client.go):
-   - Armazena as informações das faixas de áudio detectadas
-   - Disponível via API de status
+2. **`buildFFmpegArgs` modificada**:
+   - Agora mapeia **apenas o primeiro áudio** nos segmentos de vídeo: `-map 0:a:0?`
+   - Outros áudios são gerados separadamente
 
-3. **`buildFFmpegArgs` modificada** para mapear TODAS as faixas:
-   - Usa `-map 0:v:0` para vídeo
-   - Usa `-map 0:a:N` para cada faixa de áudio
-   - Adiciona metadados de idioma: `-metadata:s:a:N language=XXX`
+3. **`generateMasterPlaylist` atualizada**:
+   - Áudio primário: `#EXT-X-MEDIA` sem URI (embutido)
+   - Áudios alternativos: `#EXT-X-MEDIA` com `URI="audio_{lang}/playlist.m3u8"`
+   - Exemplo gerado:
+     ```m3u8
+     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Português",LANGUAGE="por",DEFAULT=YES,AUTOSELECT=YES
+     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="eng",DEFAULT=NO,AUTOSELECT=NO,URI="audio_eng/playlist.m3u8"
+     ```
 
-4. **`generateMasterPlaylist` atualizada**:
-   - Versão HLS 4 para suportar `#EXT-X-MEDIA`
-   - Declara cada faixa de áudio com `#EXT-X-MEDIA:TYPE=AUDIO`
-   - Referencia grupo de áudio em cada qualidade
+4. **`transcodeToHLS` atualizada**:
+   - Após iniciar transcodificações de qualidade, inicia transcodificação de áudios alternativos em paralelo
 
-5. **API de status** agora retorna `audioTracks`
-
-#### Frontend - Modificações Realizadas:
-
-1. **`updateAudioTracks` melhorada** em [ShakaVideoPlayer.jsx](frontend/src/components/player/ShakaVideoPlayer.jsx):
-   - Tenta primeiro usar `getAudioLanguagesAndRoles()` (mais confiável)
-   - Fallback para extração de `getVariantTracks()`
-   - Detecta corretamente a faixa ativa
-
-2. **`changeAudioTrack` robusta**:
-   - Usa `selectAudioLanguage()` como método principal
-   - Configura preferências para seleções futuras
-   - Fallback para `selectVariantTrack()` se necessário
-   - Atualiza estado visual imediatamente
+#### Frontend - Já Funcionando Corretamente:
+O código do Shaka Player já estava preparado para lidar com streams de áudio separados via `selectAudioLanguage()`.
 
 ---
 

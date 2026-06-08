@@ -9,6 +9,7 @@ services:
       - downloads:/app/downloads
     environment:
       - PORT=8080
+      - TMDB_API_KEY=f91068b10bbe2b1a868e58d1fae6cbb4
     # Hardware acceleration support (VAAPI) - opcional
     devices:
       - /dev/dri:/dev/dri
@@ -20,7 +21,7 @@ services:
     container_name: webtorrent-frontend
     restart: unless-stopped
     ports:
-      - "5173:80"
+      - "5175:80"
     depends_on:
       - backend
     networks:

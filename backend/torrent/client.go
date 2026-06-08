@@ -621,6 +621,21 @@ func transcodeToHLS(stream *StreamInfo) {
 		}(q)
 	}
 
+	// Se há múltiplas faixas de áudio, gerar streams de áudio separados para cada faixa alternativa
+	if len(audioTracks) > 1 {
+		log.Printf("[%s] 🔊 Iniciando transcodificação de %d faixas de áudio alternativas...", stream.ID[:8], len(audioTracks)-1)
+		for i := 1; i < len(audioTracks); i++ {
+			go func(trackIndex int, track AudioTrackInfo) {
+				err := transcodeAudioTrack(stream, trackIndex, track)
+				if err != nil {
+					log.Printf("[%s] ⚠️ Erro na transcodificação de áudio %s: %v", stream.ID[:8], track.Language, err)
+				} else {
+					log.Printf("[%s] ✅ Áudio %s (%s) pronto", stream.ID[:8], track.Language, track.Title)
+				}
+			}(i, audioTracks[i])
+		}
+	}
+
 	// Aguardar APENAS a qualidade mais baixa ter segmentos prontos para marcar "Ready"
 	// As outras qualidades continuarão sendo geradas em background.
 	log.Printf("[%s] ⏳ Aguardando segmento da qualidade base (%s) para liberar stream...", stream.ID[:8], lowestQualityName)
@@ -723,7 +738,97 @@ func transcodeQuality(stream *StreamInfo, quality QualityLevel) error {
 	return fmt.Errorf("timeout aguardando segmentos")
 }
 
-// buildFFmpegArgs constrói os argumentos do FFmpeg baseado no hardware disponível
+// transcodeAudioTrack transcodifica uma faixa de áudio específica para um stream HLS separado
+func transcodeAudioTrack(stream *StreamInfo, trackIndex int, track AudioTrackInfo) error {
+	// Criar diretório para a faixa de áudio
+	audioDir := filepath.Join(stream.HLSPath, fmt.Sprintf("audio_%s", track.Language))
+	if err := os.MkdirAll(audioDir, 0755); err != nil {
+		return err
+	}
+
+	playlistPath := filepath.Join(audioDir, "playlist.m3u8")
+	segmentPath := filepath.Join(audioDir, "segment%03d.aac")
+
+	log.Printf("[%s] 🔊 Iniciando transcodificação de áudio %s (track %d)...", 
+		stream.ID[:8], track.Language, trackIndex)
+
+	// Construir argumentos FFmpeg para áudio apenas
+	args := []string{
+		"-y",
+		"-fflags", "+genpts+igndts+discardcorrupt+nobuffer",
+		"-err_detect", "ignore_err",
+		"-analyzeduration", "2000000",
+		"-probesize", "10000000",
+		"-i", stream.VideoFile,
+		// Mapear apenas a faixa de áudio específica
+		"-map", fmt.Sprintf("0:a:%d", trackIndex),
+		// Sem vídeo
+		"-vn",
+		// Codec de áudio AAC
+		"-c:a", "aac",
+		"-b:a", "128k",
+		"-ac", "2",
+		"-ar", "48000",
+		// Metadados
+		"-metadata:s:a:0", fmt.Sprintf("language=%s", track.Language),
+	}
+
+	if track.Title != "" {
+		args = append(args, "-metadata:s:a:0", fmt.Sprintf("title=%s", track.Title))
+	}
+
+	// Configurações HLS para áudio
+	args = append(args,
+		"-hls_time", "2",
+		"-hls_list_size", "0",
+		"-hls_flags", "independent_segments+append_list+temp_file",
+		"-hls_segment_type", "mpegts",
+		"-hls_segment_filename", segmentPath,
+		"-f", "hls",
+		playlistPath,
+	)
+
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr
+
+	// Adicionar à lista de processos do stream
+	mu.Lock()
+	stream.ffmpegProcs = append(stream.ffmpegProcs, cmd)
+	mu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("erro ao iniciar FFmpeg para áudio: %v", err)
+	}
+
+	// Aguardar pelo menos 1 segmento ser criado
+	for i := 0; i < 45; i++ {
+		select {
+		case <-stream.cancelChan:
+			cmd.Process.Kill()
+			return fmt.Errorf("cancelado")
+		default:
+		}
+
+		if countSegmentsInDir(audioDir) >= 1 {
+			log.Printf("[%s] 🔊 Áudio %s: primeiro segmento pronto!", stream.ID[:8], track.Language)
+			
+			// Continuar rodando em background
+			go func() {
+				cmd.Wait()
+				log.Printf("[%s] 🔊 Áudio %s: transcodificação completa", stream.ID[:8], track.Language)
+			}()
+			
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+
+	cmd.Process.Kill()
+	return fmt.Errorf("timeout aguardando segmentos de áudio")
+}
+
+// buildFFmpegArgs constrói os argumentos do FFmpeg para vídeo + áudio primário
+// O áudio primário é incluído para compatibilidade, mas faixas extras são geradas separadamente
 func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segmentPath string, audioTracks []AudioTrackInfo) []string {
 	// Garantir que hwAccel foi detectado
 	hwAccelInit.Do(func() {
@@ -758,17 +863,9 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 	// Mapear o stream de vídeo
 	args = append(args, "-map", "0:v:0")
 
-	// Mapear TODAS as faixas de áudio
-	if len(audioTracks) > 1 {
-		// Se há múltiplas faixas, mapear cada uma explicitamente
-		for i := range audioTracks {
-			args = append(args, "-map", fmt.Sprintf("0:a:%d", i))
-		}
-		log.Printf("[FFmpeg] Mapeando %d faixas de áudio", len(audioTracks))
-	} else {
-		// Apenas uma faixa ou nenhuma detectada - mapear todas as faixas de áudio disponíveis
-		args = append(args, "-map", "0:a?")
-	}
+	// Mapear APENAS o primeiro áudio (áudio default)
+	// As outras faixas serão geradas como streams separados
+	args = append(args, "-map", "0:a:0?")
 	
 	// Adicionar filtros e codecs baseado no hardware
 	switch hwAccel {
@@ -830,7 +927,7 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 		"-sc_threshold", "0",
 	)
 	
-	// Codec de áudio AAC para TODAS as faixas
+	// Codec de áudio AAC para a faixa primária
 	args = append(args,
 		"-c:a", "aac",
 		"-b:a", quality.AudioRate,
@@ -838,11 +935,11 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 		"-ar", "48000",
 	)
 
-	// Adicionar metadados de idioma para cada faixa de áudio
-	for i, track := range audioTracks {
-		args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), fmt.Sprintf("language=%s", track.Language))
-		if track.Title != "" {
-			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), fmt.Sprintf("title=%s", track.Title))
+	// Adicionar metadados de idioma para a faixa primária
+	if len(audioTracks) > 0 {
+		args = append(args, "-metadata:s:a:0", fmt.Sprintf("language=%s", audioTracks[0].Language))
+		if audioTracks[0].Title != "" {
+			args = append(args, "-metadata:s:a:0", fmt.Sprintf("title=%s", audioTracks[0].Title))
 		}
 	}
 	
@@ -862,7 +959,7 @@ func buildFFmpegArgs(inputFile string, quality QualityLevel, playlistPath, segme
 	return args
 }
 
-// generateMasterPlaylist gera o master playlist HLS com todas as qualidades e faixas de áudio
+// generateMasterPlaylist gera o master playlist HLS com todas as qualidades e faixas de áudio separadas
 func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error {
 	masterPath := filepath.Join(stream.HLSPath, "master.m3u8")
 
@@ -879,16 +976,11 @@ func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error 
 	f.WriteString("#EXTM3U\n")
 	f.WriteString("#EXT-X-VERSION:4\n") // Versão 4 para suportar EXT-X-MEDIA
 
-	// Se há múltiplas faixas de áudio, declará-las com EXT-X-MEDIA
+	// Se há múltiplas faixas de áudio, declará-las com EXT-X-MEDIA incluindo URI
 	audioGroup := ""
 	if len(stream.AudioTracks) > 1 {
 		audioGroup = "audio"
 		for i, track := range stream.AudioTracks {
-			isDefault := "NO"
-			if track.Default || i == 0 {
-				isDefault = "YES"
-			}
-			
 			// Nome amigável para a faixa
 			name := track.Title
 			if name == "" {
@@ -898,21 +990,25 @@ func generateMasterPlaylist(stream *StreamInfo, qualities []QualityLevel) error 
 			// Canais formatados
 			channels := ""
 			if track.Channels > 0 {
-				if track.Channels >= 6 {
-					channels = fmt.Sprintf(",CHANNELS=\"%d\"", track.Channels)
-				} else {
-					channels = fmt.Sprintf(",CHANNELS=\"%d\"", track.Channels)
-				}
+				channels = fmt.Sprintf(",CHANNELS=\"%d\"", track.Channels)
 			}
 			
-			// EXT-X-MEDIA para áudio alternativo
-			// Note: Não usamos URI aqui porque o áudio está multiplexado nos segmentos .ts
-			// O Shaka Player identificará as faixas pelos metadados dos segmentos
-			f.WriteString(fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=%s,AUTOSELECT=%s%s\n",
-				audioGroup, name, track.Language, isDefault, isDefault, channels))
+			// URI para o playlist de áudio separado
+			// O primeiro áudio está embutido no vídeo, os outros têm seus próprios streams
+			if i == 0 {
+				// Áudio primário - embutido nos segmentos de vídeo, sem URI específica
+				f.WriteString(fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=YES,AUTOSELECT=YES%s\n",
+					audioGroup, name, track.Language, channels))
+			} else {
+				// Áudios alternativos - têm seus próprios playlists
+				audioPlaylistPath := fmt.Sprintf("audio_%s/playlist.m3u8", track.Language)
+				f.WriteString(fmt.Sprintf("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\",NAME=\"%s\",LANGUAGE=\"%s\",DEFAULT=NO,AUTOSELECT=NO%s,URI=\"%s\"\n",
+					audioGroup, name, track.Language, channels, audioPlaylistPath))
+			}
 		}
 		f.WriteString("\n")
-		log.Printf("[%s] 🔊 Master playlist incluiu %d faixas de áudio", stream.ID[:8], len(stream.AudioTracks))
+		log.Printf("[%s] 🔊 Master playlist incluiu %d faixas de áudio (1 embutida + %d separadas)", 
+			stream.ID[:8], len(stream.AudioTracks), len(stream.AudioTracks)-1)
 	}
 
 	// Escrever cada qualidade (ordenar por bandwidth crescente para o player)

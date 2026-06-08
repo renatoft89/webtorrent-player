@@ -49,6 +49,12 @@ func main() {
 		// Segmentos de qualidade específica (usando * para capturar subpath)
 		api.GET("/stream/:id/:quality/:segment", handlers.GetQualitySegment)
 		api.DELETE("/stream/:id", handlers.StopStream)
+
+		// TMDB Proxy
+		api.GET("/tmdb/trending", handlers.GetTMDBTrending)
+		api.GET("/tmdb/search/movie", handlers.SearchTMDBMovies)
+		api.GET("/tmdb/search/series", handlers.SearchTMDBSeries)
+		api.GET("/tmdb/external-ids", handlers.GetTMDBExternalIDs)
 	}
 
 	// Servir arquivos HLS
